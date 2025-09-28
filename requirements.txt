@@ -1,3 +1,4 @@
+torch
 streamlit
 python-dotenv
 langchain-core
@@ -6,3 +7,12 @@ spacy
 spacy-layout
 langchain-text-splitters
 pydantic
+sentence-transformers
+neo4j
+langchain-together
+langgraph
+pydot
+graphviz
+mcp
+langchain-mcp-adapters
+

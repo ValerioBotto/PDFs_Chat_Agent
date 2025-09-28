@@ -1,126 +1,491 @@
-# main.py
-
 import streamlit as st
 import os
-import time
 import logging
+import asyncio
+from typing import List, Any
 
-# importa le nuove funzioni dal backend
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
+from langchain_together import ChatTogether
+
 from backend.pdf_utils.loader import get_layout_extractor
 from backend.pdf_utils.preprocessor import split_sections_with_layout
-from backend.pdf_utils.chunker import split_sections_into_chunks # importa il nuovo chucker
+from backend.pdf_utils.chunker import split_sections_into_chunks
+from backend.pdf_utils.indexer import Indexer
+from backend.pdf_utils.extractor import Extractor
+
+from backend.pdf_utils.agent.agent import (
+    _build_agent_workflow,
+    initialize_agent_tools_resources,
+    invoke_agent,
+)
+
+from backend.pdf_utils.graph_db import GraphDB
+
+from mcp.client.stdio import stdio_client
+from mcp import ClientSession, StdioServerParameters
+from langchain_mcp_adapters.tools import load_mcp_tools
+
+from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 
-# configurazione della pagina streamlit
+#carica le variabili d'ambiente
+load_dotenv()
+TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY")
+
+#configurazione streamlit
 st.set_page_config(page_title="chat con pdf", layout="wide")
 
-# inizializza lo stato della sessione per la cronologia della chat
+#inizializzazione stato sessione
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
-if "agent" not in st.session_state:
-    st.session_state.agent = None
+if "agent_app" not in st.session_state:
+    st.session_state.agent_app = None
 if "pdf_uploaded" not in st.session_state:
     st.session_state.pdf_uploaded = False
-if "layout_extractor" not in st.session_state: # inizializza l'estrattore solo una volta
+if "layout_extractor" not in st.session_state:
     st.session_state.layout_extractor = get_layout_extractor()
+if "indexer" not in st.session_state:
+    st.session_state.indexer = Indexer()
+if "extractor" not in st.session_state:
+    st.session_state.extractor = Extractor()
+if "llm_agent" not in st.session_state:
+    st.session_state.llm_agent = ChatTogether(
+        model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
+        temperature=1.0,
+        together_api_key=TOGETHER_API_KEY,
+        max_tokens=1024,
+        max_retries=3,
+        timeout=60,
+    )
 
-# sidebar con upload pdf
+#variabili mcp nello stato
+if "mcp_client" not in st.session_state:
+    st.session_state.mcp_client = None
+if "mcp_client_context" not in st.session_state:
+    st.session_state.mcp_client_context = None
+if "mcp_session" not in st.session_state:
+    st.session_state.mcp_session = None
+if "mcp_session_context" not in st.session_state:
+    st.session_state.mcp_session_context = None
+
+
+class OllamaWrapper:
+    def __init__(self, model_name: str = "llama3.2:latest", timeout: int = 30):
+        self.model = model_name
+        self.timeout = timeout
+        self._bound_tools = None
+
+    def _messages_to_prompt(self, messages: List[BaseMessage]) -> str:
+        parts = []
+        for m in messages:
+            role = getattr(m, "type", None) or m.__class__.__name__
+            text = getattr(m, "content", str(m))
+            parts.append(f"[{role}]\n{text}\n")
+        return "\n".join(parts)
+
+    def invoke(self, messages: List[BaseMessage]):
+        prompt = self._messages_to_prompt(messages)
+        # if tools are bound, prepend a tools description and an instruction to output JSON for tool calls
+        tool_instructions = ""
+        if self._bound_tools:
+            descr_lines = [
+                '''You have access to the following tools. If you decide a tool should be called, output a single-line JSON object with the key "tool_calls" containing a list of calls. Example:
+{"tool_calls": [{"name": "neo4j_vector_search", "args": {"query": "...", "k": 2}}]}
+Otherwise, output a normal textual answer without that JSON line.''',
+            ]
+            for t in self._bound_tools:
+                tname = getattr(t, 'name', None) or getattr(t, '__name__', str(t))
+                tdesc = getattr(t, 'description', None) or (getattr(t, '__doc__', '') or '').splitlines()[0]
+                descr_lines.append(f"- {tname}: {tdesc}")
+            tool_instructions = "\n".join(descr_lines) + "\n\n"
+
+        full_prompt = tool_instructions + prompt
+
+        # use ollama run with positional prompt argument to avoid unsupported flags
+        import subprocess, json, re
+        args = ["ollama", "run", self.model, full_prompt]
+        try:
+            proc = subprocess.run(
+                args,
+                capture_output=True,
+                check=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=self.timeout,
+            )
+            text = proc.stdout.strip()
+            # try to parse a single-line JSON object with tool_calls
+            tool_calls = None
+            try:
+                # extract first JSON-looking substring
+                m = re.search(r"(\{\s*\"tool_calls\"[\s\S]*?\})", text)
+                if m:
+                    json_part = m.group(1)
+                    parsed = json.loads(json_part)
+                    tool_calls = parsed.get('tool_calls')
+            except Exception:
+                tool_calls = None
+
+            class Resp:
+                pass
+
+            r = Resp()
+            r.content = text
+            if tool_calls:
+                r.tool_calls = tool_calls
+            return r
+        except subprocess.CalledProcessError as e:
+            stderr = e.stderr or e.output or ""
+            raise RuntimeError(f"ollama invoke failed: {stderr}")
+        except subprocess.TimeoutExpired as e:
+            # primo timeout: proviamo un retry con timeout raddoppiato (fino a 120s)
+            logger.warning(f"ollama invoke timed out after {self.timeout}s; retrying with longer timeout.")
+            try:
+                proc = subprocess.run(
+                    args,
+                    capture_output=True,
+                    check=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=min(self.timeout * 2, 120),
+                )
+                text = proc.stdout.strip()
+                class Resp:
+                    pass
+
+                r = Resp()
+                r.content = text
+                return r
+            except subprocess.CalledProcessError as e2:
+                stderr = e2.stderr or e2.output or ""
+                raise RuntimeError(f"ollama invoke failed on retry: {stderr}")
+            except subprocess.TimeoutExpired:
+                raise RuntimeError("ollama invoke timeout")
+
+    def bind_tools(self, tools: List[Any]):
+        # store tools metadata so invoke can include descriptions
+        self._bound_tools = tools
+        return self
+
+
+#funzione: ottieni o crea un event loop
+def get_or_create_event_loop():
+    try:
+        return asyncio.get_event_loop()
+    except RuntimeError as ex:
+        if "There is no current event loop in thread" in str(ex):
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            return loop
+        raise
+
+
+#fallback: embedding della domanda, ricerca vettoriale su neo4j e chiamata diretta all'llm
+def direct_vector_qa(user_question: str, indexer_instance: Indexer, llm_agent: ChatTogether, top_k: int = 5) -> str:
+    try:
+        #1) genera embedding della domanda
+        query_embedding = indexer_instance.generate_embeddings(user_question)
+
+        #2) ricerca su neo4j
+        graph_db = GraphDB()
+        results = graph_db.query_vector_index("chunk_embeddings_index", query_embedding, k=top_k)
+
+        if not results:
+            graph_db.close()
+            return "Nessun chunk rilevante trovato nel documento tramite ricerca vettoriale."
+
+        #log diagnostico
+        logger.info(f"direct_vector_qa: retrieved {len(results)} results from Neo4j.")
+        for i, r in enumerate(results, start=1):
+            logger.debug(f"result #{i}: keys={list(r.keys())}")
+            if "score" in r:
+                logger.debug(f" result #{i} score: {r.get('score')}")
+
+        #3) prepara estratti
+        excerpts = []
+        for i, r in enumerate(results, start=1):
+            content = r.get("node_content", "").strip()
+            excerpt = content if len(content) <= 1000 else content[:1000] + " ...[troncato]"
+            excerpts.append(f"[{i}] {excerpt}")
+
+        joined_context = "\n\n".join(excerpts)
+
+        #prompt strutturato
+        system_msg = (
+            "Sei un Assistente alla consultazione di PDF. Rispondi alla domanda dell'utente in modo chiaro e conciso utilizzando il contenuto degli estratti. "
+            "Nella tua risposta cita gli estratti utilizzati con il relativo numero tra parentesi quadre. "
+            "Se l'informazione non è presente nei chunk, rispondi che non è disponibile e non inventare."
+        )
+
+        prompt = f"{system_msg}\n\nContesto (estratti dal documento):\n{joined_context}\n\nDomanda: {user_question}"
+
+        #4) chiama l'llm direttamente
+        messages = [HumanMessage(content=prompt)]
+        response = llm_agent.invoke(messages)
+        resp_text = getattr(response, "content", None) or str(response)
+
+        graph_db.close()
+        return resp_text
+
+    except Exception as e:
+        logger.exception(f"direct_vector_qa fallback error: {e}")
+        try:
+            graph_db.close()
+        except Exception:
+            pass
+        return f"Errore durante ricerca diretta: {str(e)}"
+
+
+#funzione per inizializzare l'agente e mcp in un contesto asincrono
+async def setup_agent_and_mcp(uploaded_file_data, llm_agent, indexer_instance, extractor_instance):
+    if not TOGETHER_API_KEY:
+        st.error("ERRORE: TOGETHER_API_KEY non impostata nel file .env. L'agente e l'estrattore non possono funzionare.")
+        return False
+
+    #assicurati che l'agente e le sessioni mcp siano null prima di ripartire
+    if st.session_state.agent_app is not None:
+        st.session_state.agent_app = None
+
+    #chiudi eventuali context manager mcp aperti
+    if st.session_state.mcp_session_context:
+        try:
+            await st.session_state.mcp_session_context.__aexit__(None, None, None)
+        except Exception as e:
+            logger.warning(f"Errore durante la chiusura di mcp_session_context: {e}")
+        st.session_state.mcp_session_context = None
+        st.session_state.mcp_session = None
+
+    if st.session_state.mcp_client_context:
+        try:
+            await st.session_state.mcp_client_context.__aexit__(None, None, None)
+        except Exception as e:
+            logger.warning(f"Errore durante la chiusura di mcp_client_context: {e}")
+        st.session_state.mcp_client_context = None
+        st.session_state.mcp_client = None
+
+    #reset stato per nuovo caricamento
+    st.session_state.pdf_uploaded = False
+    st.session_state.chat_history = []
+    st.session_state.processed_chunks = []
+    st.session_state.uploaded_filename = uploaded_file_data.name
+
+    file_bytes = uploaded_file_data.getvalue()
+    logger.debug(f"pdf file size: {len(file_bytes)} bytes")
+
+    graph_db = None
+    try:
+        #1) processing del pdf
+        doc = st.session_state.layout_extractor(file_bytes)
+        if doc is None:
+            raise ValueError("errore nell'estrazione del documento dal pdf.")
+
+        sections = split_sections_with_layout(doc)
+        st.session_state.processed_sections = sections
+
+        chunks = split_sections_into_chunks(sections)
+        st.session_state.processed_chunks = chunks
+        logger.info(f"total of {len(chunks)} chunks generated from all sections.")
+
+        #2) interazione con neo4j e indicizzazione
+        graph_db = GraphDB()
+        user_id = "default_user"
+        graph_db.create_user(user_id)
+        graph_db.create_document(st.session_state.uploaded_filename)
+        graph_db.link_user_to_document(user_id, st.session_state.uploaded_filename)
+
+        indexer_instance.index_chunks_to_neo4j(st.session_state.uploaded_filename, chunks)
+
+        full_text = doc.text
+        st.info("estrazione di topic ed entità dal documento...")
+        topics = extractor_instance.extract_topics(full_text)
+        for topic in topics:
+            graph_db.add_topic_to_neo4j(topic, st.session_state.uploaded_filename)
+
+        entities = extractor_instance.extract_entities(full_text)
+        for entity_type, entity_names in entities.items():
+            for entity_name in entity_names:
+                graph_db.add_entity_to_neo4j(entity_type, entity_name, st.session_state.uploaded_filename)
+
+        #dopo l'ingestion chiudiamo la connessione locale
+        graph_db.close()
+        graph_db = None
+
+        #3) avvio mcp server e creazione agente
+        neo4j_mcp_server_params = StdioServerParameters(
+            command="uvx",
+            args=["mcp-neo4j-cypher@0.3.0", "--transport", "stdio"],
+            env={
+                "NEO4J_URI": os.getenv("NEO4J_URI", "bolt://localhost:7687"),
+                "NEO4J_USERNAME": os.getenv("NEO4J_USERNAME", "neo4j"),
+                "NEO4J_PASSWORD": os.getenv("NEO4J_PASSWORD"),
+                "NEO4J_DATABASE": os.getenv("NEO4J_DATABASE", "neo4j"),
+            },
+        )
+
+        st.session_state.mcp_client = stdio_client(neo4j_mcp_server_params)
+        st.session_state.mcp_client_context = await st.session_state.mcp_client.__aenter__()
+
+        read_stream, write_stream = st.session_state.mcp_client_context
+        st.session_state.mcp_session = ClientSession(read_stream, write_stream)
+        st.session_state.mcp_session_context = await st.session_state.mcp_session.__aenter__()
+
+        await st.session_state.mcp_session.initialize()
+        loaded_mcp_tools = await load_mcp_tools(st.session_state.mcp_session)
+        logger.info(f"tool MCP caricati: {[t.name for t in loaded_mcp_tools]}")
+
+        filtered_mcp_tools = [t for t in loaded_mcp_tools if t.name in ["read_neo4j_cypher", "get_neo4j_schema"]]
+
+        # costruisci agente langgraph con planner locale (Ollama) per planning e Together per la synth finale
+        planner = OllamaWrapper(model_name=os.getenv("OLLAMA_MODEL", "llama3.2:latest"), timeout=int(os.getenv("OLLAMA_TIMEOUT", "20")))
+        synth = st.session_state.llm_agent
+
+        st.session_state.agent_app = _build_agent_workflow(
+            planner_llm=planner,
+            synth_llm=synth,
+            mcp_loaded_tools=filtered_mcp_tools,
+        )
+
+        #inizializza risorse globali dei tool
+        agent_graph_db = GraphDB()
+        initialize_agent_tools_resources(agent_graph_db, indexer_instance)
+
+        st.session_state.pdf_uploaded = True
+        st.success("documento elaborato e agente inizializzato")
+        return True
+
+    except Exception as e:
+        st.error(f"errore durante l'elaborazione o indicizzazione del pdf: {str(e)}")
+        logger.exception("errore critico nel processo di upload/indicizzazione del pdf.", exc_info=True)
+
+        #pulizia robusta in caso di errore
+        st.session_state.pdf_uploaded = False
+        st.session_state.agent_app = None
+
+        #chiusura context manager asincroni
+        if st.session_state.mcp_session_context:
+            try:
+                await st.session_state.mcp_session_context.__aexit__(None, None, None)
+            except Exception as e_close:
+                logger.warning(f"Errore durante la chiusura di mcp_session_context: {e_close}")
+            st.session_state.mcp_session = None
+
+        if st.session_state.mcp_client_context:
+            try:
+                await st.session_state.mcp_client_context.__aenter__(None, None, None)
+            except Exception as e_close:
+                logger.warning(f"Errore durante la chiusura di mcp_client_context: {e_close}")
+            st.session_state.mcp_client = None
+
+        initialize_agent_tools_resources(None, None)
+        return False
+
+
+#sidebar streamlit
 with st.sidebar:
     st.header("📁 carica documento")
     uploaded_file = st.file_uploader("seleziona un pdf", type=["pdf"])
-    
+
+    # gestione del caricamento del file e setup dell'agente
     if uploaded_file:
-        # verifica se è un nuovo file o lo stato è stato resettato
         if not st.session_state.pdf_uploaded or (
-            hasattr(st.session_state, 'uploaded_filename') and
             st.session_state.uploaded_filename != uploaded_file.name
-        ):
-            st.info("caricamento e elaborazione del pdf...")
-            st.session_state.chat_history = [] # pulisce la cronologia se nuovo pdf
-            st.session_state.processed_chunks = [] # resetta i chunk processati per il nuovo file
-            st.session_state.uploaded_filename = uploaded_file.name # memorizza il nome del file caricato
-            
-            # --- inizio elaborazione pdf ---
-            
-            # legge i bytes del file
-            file_bytes = uploaded_file.getvalue()
-            logger.debug(f"pdf file size: {len(file_bytes)} bytes")
-            
-            try:
-                # 1. estrazione struttura con spacy-layout
-                doc = st.session_state.layout_extractor(file_bytes)
-                if doc is None:
-                    raise ValueError("errore nell'estrazione del documento dal pdf.")
-                logger.debug("document layout extraction completed.")
+            if hasattr(st.session_state, "uploaded_filename")
+            else True
+        ) or st.session_state.mcp_client is None or st.session_state.mcp_session is None:
 
-                # 2. segmentazione del documento in sezioni
-                sections = split_sections_with_layout(doc)
-                st.session_state.processed_sections = sections # memorizza le sezioni processate
-                logger.debug(f"document split into {len(sections)} logical sections.")
+            with st.spinner("preparazione ambiente e agente..."):
+                loop = get_or_create_event_loop()
+                success = loop.run_until_complete(
+                    setup_agent_and_mcp(
+                        uploaded_file,
+                        st.session_state.llm_agent,
+                        st.session_state.indexer,
+                        st.session_state.extractor,
+                    )
+                )
+            if success:
+                st.rerun()
 
-                # 3. suddivisione delle sezioni in chunk
-                chunks = split_sections_into_chunks(sections)
-                st.session_state.processed_chunks = chunks # memorizza i chunk processati
-                logger.info(f"total of {len(chunks)} chunks generated from all sections.")
-                
-                # qui in futuro ci sarà la logica per l'indicizzazione e la creazione dell'agente
-                # al momento, solo una simulazione
-                st.session_state.agent = "simulated_agent" # placeholder
-                st.session_state.pdf_uploaded = True
-                st.success("✅ documento elaborato con successo!")
-                
-            except Exception as e:
-                st.error(f"❌ errore durante l'elaborazione del pdf: {str(e)}")
-                st.session_state.pdf_uploaded = False # resetta lo stato di caricamento in caso di errore
-                st.session_state.agent = None
-            
-            # --- fine elaborazione pdf ---
-            
-            st.rerun() # aggiorna la pagina per mostrare l'interfaccia di chat
-            
-    # bottone per pulire la chat e resettare l'agente
+    # bottone per pulire chat e resettare pdf
     if st.session_state.pdf_uploaded:
         if st.button("🗑️ pulisci chat e resetta pdf"):
             st.session_state.chat_history = []
-            st.session_state.agent = None
+            st.session_state.agent_app = None
             st.session_state.pdf_uploaded = False
-            if hasattr(st.session_state, 'uploaded_filename'):
-                del st.session_state.uploaded_filename # resetta il nome del file
-            if hasattr(st.session_state, 'processed_sections'):
+            if hasattr(st.session_state, "uploaded_filename"):
+                del st.session_state.uploaded_filename
+            if hasattr(st.session_state, "processed_sections"):
                 del st.session_state.processed_sections
-            if hasattr(st.session_state, 'processed_chunks'):
+            if hasattr(st.session_state, "processed_chunks"):
                 del st.session_state.processed_chunks
+
+            #chiudi le sessioni mcp
+            if st.session_state.mcp_session_context:
+                asyncio.run(st.session_state.mcp_session_context.__aexit__(None, None, None))
+                st.session_state.mcp_session_context = None
+                st.session_state.mcp_session = None
+
+            if st.session_state.mcp_client_context:
+                asyncio.run(st.session_state.mcp_client_context.__aexit__(None, None, None))
+                st.session_state.mcp_client_context = None
+                st.session_state.mcp_client = None
+
+            initialize_agent_tools_resources(None, None)
             st.info("chat e stato pdf resettati.")
             st.rerun()
 
-# area centrale della pagina streamlit per la chat
-if st.session_state.pdf_uploaded and st.session_state.agent:
+
+#area centrale: chat con l'agente
+if st.session_state.pdf_uploaded and st.session_state.agent_app:
     st.title("💬 chatta con il tuo pdf")
 
-    # visualizza la cronologia della chat
-    for role, message in st.session_state.chat_history:
+    #render della cronologia: stocchiamo oggetti BaseMessage nella chat_history
+    for msg in st.session_state.chat_history:
+        role = "user" if isinstance(msg, HumanMessage) else "assistant"
         with st.chat_message(role):
-            st.markdown(message)
+            st.markdown(msg.content if isinstance(msg, BaseMessage) else str(msg))
 
-    # campo di input per l'utente
     user_message = st.chat_input("fai una domanda sul documento...")
-    
+
     if user_message:
-        # aggiungi il messaggio dell'utente alla cronologia
-        st.session_state.chat_history.append(("user", user_message))
+        st.session_state.chat_history.append(HumanMessage(content=user_message))
         with st.chat_message("user"):
             st.markdown(user_message)
 
-        # simulazione della risposta dell'agente
         with st.chat_message("assistant"):
-            with st.spinner("🤔 sto elaborando la risposta..."):
-                time.sleep(2) # simula il tempo di elaborazione
-                # questa sarà la parte che invocherà il tuo agente reale
-                response = f"hai chiesto: '{user_message}'. al momento posso solo simulare una risposta."
-                st.markdown(response)
-            st.session_state.chat_history.append(("assistant", response))
+            with st.spinner("l'agente sta elaborando la risposta..."):
+                try:
+                    loop = get_or_create_event_loop()
+                    try:
+                        response_content = loop.run_until_complete(
+                            asyncio.wait_for(
+                                invoke_agent(
+                                    st.session_state.agent_app, user_message, st.session_state.chat_history
+                                ),
+                                timeout=90,
+                            )
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning("invoke_agent timed out; using direct_vector_qa fallback.")
+                        response_content = direct_vector_qa(
+                            user_message, st.session_state.indexer, st.session_state.llm_agent
+                        )
+
+                    logger.debug(f"invoke_agent returned: {response_content}")
+                    if not response_content:
+                        st.warning("l'agente non ha restituito una risposta. controlla i log.")
+                        response_content = "mi dispiace, non sono riuscito a generare una risposta. prova a riformulare la domanda o riprova più tardi."
+                    elif response_content.startswith("Errore") or "rate-limiting" in response_content.lower():
+                        st.error(response_content)
+
+                    st.markdown(response_content)
+                    st.session_state.chat_history.append(AIMessage(content=response_content))
+                except Exception as e:
+                    st.error(f"errore durante l'interazione con l'agente: {e}")
+                    logger.exception("errore nell'invoke dell'agente.")
 
 else:
-    # messaggio iniziale di default
     st.info("👈 carica un pdf dalla sidebar per iniziare la conversazione")
