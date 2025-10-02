@@ -2,6 +2,7 @@ import streamlit as st
 import os
 import logging
 import asyncio
+import uuid
 from typing import List, Any
 
 class OllamaWrapper:
@@ -13,6 +14,7 @@ class OllamaWrapper:
         logger.info(f"OllamaWrapper initialized with model={model_name}, timeout={timeout}s")
 
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
+from langchain_core.messages import ToolMessage
 from langchain_together import ChatTogether
 
 from backend.pdf_utils.loader import get_layout_extractor
@@ -26,6 +28,8 @@ from backend.pdf_utils.agent.agent import (
     initialize_agent_tools_resources,
     invoke_agent,
 )
+# langgraph in-memory checkpointer for tutorial-style memory
+from langgraph.checkpoint.memory import InMemorySaver
 
 from backend.pdf_utils.graph_db import GraphDB
 
@@ -385,10 +389,21 @@ async def setup_agent_and_mcp(uploaded_file_data, llm_agent, indexer_instance, e
         planner = OllamaWrapper(model_name=os.getenv("OLLAMA_MODEL", "llama3.2:1b"), timeout=int(os.getenv("OLLAMA_TIMEOUT", "90")))
         synth = st.session_state.llm_agent
 
+        # create an in-memory saver to enable LangGraph checkpointer-based memory
+        memory = InMemorySaver()
+        # store memory in session so it persists for this Streamlit session
+        st.session_state.agent_memory = memory
+
+        # generate or reuse a thread_id for this session (used by the checkpointer)
+        if "thread_id" not in st.session_state:
+            # use filename + timestamp to scope memory per uploaded document/session
+            st.session_state.thread_id = f"session-{uuid.uuid4().hex[:8]}"
+
         st.session_state.agent_app = _build_agent_workflow(
             planner_llm=planner,
             synth_llm=synth,
             mcp_loaded_tools=filtered_mcp_tools,
+            checkpointer=memory,
         )
 
         #inizializza risorse globali dei tool
@@ -430,6 +445,60 @@ async def setup_agent_and_mcp(uploaded_file_data, llm_agent, indexer_instance, e
 with st.sidebar:
     st.header("📁 carica documento")
     uploaded_file = st.file_uploader("seleziona un pdf", type=["pdf"])
+
+    # Debug: show InMemorySaver checkpoints and agent state for current session
+    try:
+        if st.session_state.get("agent_app") is not None and st.session_state.get("agent_memory") is not None:
+            if st.button("🔎 mostra checkpoint memoria (debug)"):
+                mem = st.session_state.get("agent_memory")
+                thread = st.session_state.get("thread_id")
+                st.write(f"thread_id: {thread}")
+                try:
+                    cps = list(mem.list({"configurable": {"thread_id": thread}}))
+                    if not cps:
+                        st.info("Nessun checkpoint trovato per questo thread nella InMemorySaver.")
+                    else:
+                        for ct in cps:
+                            try:
+                                ck = getattr(ct, 'checkpoint', ct)
+                                st.write({
+                                    "id": ck.get("id"),
+                                    "channel_values": ck.get("channel_values"),
+                                    "channel_versions": ck.get("channel_versions"),
+                                })
+                            except Exception:
+                                st.write(repr(ct))
+                except Exception as e:
+                    st.error(f"errore leggendo checkpoint da InMemorySaver: {e}")
+
+                # also attempt to fetch graph's state snapshot if supported
+                try:
+                    cfg = {"configurable": {"thread_id": thread}}
+                    snapshot = None
+                    try:
+                        snapshot = st.session_state.agent_app.get_state(cfg)
+                    except Exception:
+                        # some compiled apps expose get_state without requiring cfg
+                        try:
+                            snapshot = st.session_state.agent_app.get_state()
+                        except Exception:
+                            snapshot = None
+                    if snapshot is None:
+                        st.info("agent_app.get_state non disponibile o non ha restituito snapshot.")
+                    else:
+                        # display a compact view
+                        try:
+                            st.write({
+                                "values_keys": list(snapshot.values.keys()) if hasattr(snapshot, 'values') and isinstance(snapshot.values, dict) else str(type(snapshot))
+                            })
+                            st.write(snapshot)
+                        except Exception:
+                            st.write(repr(snapshot))
+                except Exception as e:
+                    st.error(f"errore ottenendo snapshot da agent_app: {e}")
+    except Exception:
+        # do not block normal flow if debug widget fails
+        pass
 
     # gestione del caricamento del file e setup dell'agente
     if uploaded_file:
@@ -503,19 +572,31 @@ if st.session_state.pdf_uploaded and st.session_state.agent_app:
                 try:
                     loop = get_or_create_event_loop()
                     try:
+                        # Use the persistent session thread id so the compiled graph's
+                        # InMemorySaver can restore prior conversation state and memory.
+                        # This enables multi-turn memory as in the LangGraph tutorial.
+                        session_thread = st.session_state.get("thread_id")
+                        if not session_thread:
+                            # fallback: ensure a thread id exists
+                            session_thread = f"session-{uuid.uuid4().hex[:8]}"
+                            st.session_state.thread_id = session_thread
+
+                        # Use persistent session thread id as the LangGraph thread key
+                        cfg = {"configurable": {"thread_id": session_thread}}
+
+                        # pass the current chat_history directly; let LangGraph + InMemorySaver
+                        # restore and manage conversation state per the official tutorial
                         response_content = loop.run_until_complete(
                             asyncio.wait_for(
                                 invoke_agent(
-                                    st.session_state.agent_app, user_message, st.session_state.chat_history
+                                    st.session_state.agent_app, user_message, st.session_state.chat_history, cfg
                                 ),
                                 timeout=180,
                             )
                         )
                     except asyncio.TimeoutError:
-                        logger.warning("invoke_agent timed out; using direct_vector_qa fallback.")
-                        response_content = direct_vector_qa(
-                            user_message, st.session_state.indexer, st.session_state.llm_agent
-                        )
+                        logger.warning("invoke_agent timed out.")
+                        response_content = "Errore: l'agente ha impiegato troppo tempo per rispondere. Riprova più tardi."
                     # original behavior: no checkpoint recovery, let invoke_agent results surface
 
                     logger.debug(f"invoke_agent returned: {response_content}")

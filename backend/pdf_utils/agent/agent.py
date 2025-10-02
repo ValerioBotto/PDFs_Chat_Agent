@@ -101,7 +101,7 @@ def neo4j_vector_search(query: str, k: int = DEFAULT_K) -> str:
 
 # --- workflow builder (simple, doc-like) ---
 
-def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_tools: List[Any] = None, mcp_loaded_tools: List[Any] = None):
+def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_tools: List[Any] = None, mcp_loaded_tools: List[Any] = None, checkpointer: Any = None):
     # simple defaults
     planner = planner_llm
     synth = synth_llm or planner_llm
@@ -114,6 +114,17 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
     tools = [firewall_check, neo4j_vector_search]
     if mcp_tools:
         tools.extend(mcp_tools)
+
+    # If the planner supports tool metadata binding, give it the available tools so it
+    # is less likely to hallucinate unknown tool names or output irrelevant tool calls.
+    try:
+        if planner is not None and hasattr(planner, "bind_tools"):
+            try:
+                planner.bind_tools(tools)
+            except Exception:
+                logger.debug("planner.bind_tools failed; continuing without binding")
+    except Exception:
+        pass
 
     # node: firewall - validate user query
     def node_firewall(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -184,12 +195,15 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
     def node_planner(state: Dict[str, Any]) -> Dict[str, Any]:
         q = state.get("question", "")
         # build a strict prompt: planner MUST output a single JSON object and nothing else
+        # include a precise list of allowed tool names to reduce hallucination of tools
+        allowed_tools_list = ", ".join([getattr(t, 'name', None) or getattr(t, '__name__', str(t)) for t in tools])
         prompt = (
             "you are a planner. OUTPUT A SINGLE VALID JSON OBJECT AND NOTHING ELSE.\n"
             "the JSON must have the key \"tool_calls\" whose value is a list of calls.\n"
             "each call is an object with fields: \"name\" (string) and \"args\" (object).\n"
             "if no tools are required, output exactly: {\"tool_calls\": []} and no additional text.\n"
             "do not output any explanatory text, commentary, or surrounding backticks — only the JSON object.\n"
+            "ONLY use these tool names (case-sensitive): " + allowed_tools_list + "\n"
             "available tool example: {\"tool_calls\": [{\"name\": \"neo4j_vector_search\", \"args\": {\"query\": \"...\", \"k\": 2}}]}\n"
             f"user_question: {q}\n"
         )
@@ -205,20 +219,34 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
             text = ""
             tool_calls = None
 
-        # try to parse single-line json if planner emitted it in text
+        # try to parse JSON fragments if planner emitted them in text. Models sometimes
+        # output multiple JSON objects or trailing text, so search for all json objects
+        # containing "tool_calls" and pick the last valid one (prefer last decision).
         parsed_calls = None
-        if not tool_calls:
-            # look for json containing tool_calls
+        if tool_calls:
+            parsed_calls = tool_calls
+        else:
             try:
                 import re
-                m = re.search(r"(\{[\s\S]*\"tool_calls\"[\s\S]*\})", text)
-                if m:
-                    parsed = json.loads(m.group(1))
-                    parsed_calls = parsed.get("tool_calls")
+                matches = re.findall(r"(\{[\s\S]*?\"tool_calls\"[\s\S]*?\})", text)
+                parsed_list = []
+                for part in matches:
+                    try:
+                        parsed = json.loads(part)
+                        if isinstance(parsed, dict) and "tool_calls" in parsed:
+                            parsed_list.append(parsed.get("tool_calls"))
+                    except Exception:
+                        # skip invalid json part
+                        continue
+                if parsed_list:
+                    # prefer the last parsed tool_calls entry
+                    parsed_calls = parsed_list[-1]
+                else:
+                    parsed_calls = None
+                had_json_fragment = bool(matches)
             except Exception:
                 parsed_calls = None
-        else:
-            parsed_calls = tool_calls
+                had_json_fragment = False
 
         logger.info(f"node_planner: text={text[:400].replace('\n',' ')} parsed_calls={repr(parsed_calls)[:800]}")
 
@@ -237,8 +265,14 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
             except Exception:
                 is_json_like = False
 
-            if is_json_like:
-                logger.info("node_planner: planner returned JSON-only with no tool_calls; proceeding to synth")
+            # also treat any text containing brace pairs as a JSON fragment to avoid
+            # exposing planner-emitted JSON or hallucinated tool names to the user
+            had_json_fragment = locals().get('had_json_fragment') or ('{' in (text or '') and '}' in (text or ''))
+
+            if is_json_like or had_json_fragment:
+                # planner returned only JSON or contained a JSON fragment — do not append raw
+                # planner JSON/text to user chat. Proceed to synth using context.
+                logger.info("node_planner: planner returned JSON-only or contained JSON fragment; proceeding to synth without exposing raw planner text")
                 return {"chat_history": state.get("chat_history", []), "synth": True}
 
             # otherwise store planner textual rationale as AIMessage and signal synth
@@ -295,9 +329,20 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
                 logger.warning(f"node_planner: planner requested unknown or disallowed tool '{item.get('name')}', ignoring it")
 
         if not filtered:
-            # no valid tool calls -> proceed to synth (do not expose planner JSON to user)
-            logger.info("node_planner: no valid tool_calls after filtering; proceeding to synth")
-            return {"chat_history": state.get("chat_history", []), "synth": True}
+            # no valid tool calls -> instead of proceeding directly to synth, force a
+            # neo4j_vector_search call using the current user question. This ensures
+            # every user question triggers a fresh vector search and a tool call
+            # cycle (presearch already ran before planner, but planner may choose
+            # to synth without executing further tools; forcing here guarantees
+            # an additional tool execution pass when the planner didn't request any).
+            logger.info("node_planner: no valid tool_calls after filtering; forcing neo4j_vector_search intermediate step for current question")
+            try:
+                forced_tid = f"tc-forced-{uuid.uuid4().hex[:8]}"
+                forced_step = {"name": "neo4j_vector_search", "args": {"query": q, "k": DEFAULT_K}, "id": forced_tid}
+                return {"chat_history": state.get("chat_history", []), "intermediate_steps": [forced_step]}
+            except Exception:
+                logger.exception("node_planner: failed to create forced intermediate step; falling back to synth")
+                return {"chat_history": state.get("chat_history", []), "synth": True}
 
         return {"chat_history": state.get("chat_history", []), "intermediate_steps": filtered}
 
@@ -334,6 +379,15 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
                         args["k"] = DEFAULT_K
         except Exception:
             logger.exception("node_call_tool: error sanitizing args")
+
+        # Defensive guarantee: if the tool is neo4j_vector_search, always search using the
+        # current state's question. This prevents planner-provided args containing
+        # previous queries or embedded JSON from causing repeated/incorrect searches.
+        try:
+            if isinstance(name, str) and "neo4j_vector_search" in name.lower():
+                args["query"] = state.get("question", args.get("query", "")) or ""
+        except Exception:
+            logger.exception("node_call_tool: failed to enforce current question for neo4j_vector_search")
 
         logger.info(f"node_call_tool: executing {name} with args={args}")
 
@@ -393,14 +447,43 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
         chat = state.get("chat_history", [])
         # keep only last N messages to avoid token overload
         # increase history so synth sees more retrieved chunks (but still bounded)
-        MAX_HISTORY = 20
+        MAX_HISTORY = 40
         context = chat[-MAX_HISTORY:]
         # build prompt: system + context
         system = (
-            "you are a helpful assistant. answer the user's question strictly using the provided context. "
-            "cite chunk numbers where appropriate. if not present, say you cannot answer."
+            "You are a helpful assistant specialized in answering questions about a document given a conversation history and retrieved document chunks. "
+            "Always prioritize the last user's question and answer it directly using the provided context. "
+            "Use facts mentioned earlier in the conversation (for example, if the user said 'mi chiamo <name>' use that name when addressing them). "
+            "Cite chunk numbers where appropriate. If the information is not present in the provided chunks or conversation, state that you cannot answer and avoid inventing facts. "
+            "If the same question was already fully answered earlier, do not repeat verbatim the previous full answer; instead, acknowledge the previous answer and provide only new information or clarify what is missing."
         )
+        # Ensure the user's current question is included explicitly as the last HumanMessage
+        try:
+            current_q = state.get("question") or ""
+        except Exception:
+            current_q = ""
+
+        # build messages: system + context + explicit current question (helps model focus on follow-up)
         msgs = [HumanMessage(content=system)] + context
+        try:
+            # append explicit question as last message to guarantee visibility
+            if current_q:
+                msgs.append(HumanMessage(content=current_q))
+        except Exception:
+            pass
+
+        # diagnostic logging: preview the messages sent to synth (truncated)
+        try:
+            preview = []
+            for m in msgs[-12:]:
+                t = type(m).__name__
+                c = (getattr(m, 'content', '') or '')
+                c_short = c.replace('\n', ' ')[:300]
+                preview.append(f"{t}:{c_short}")
+            logger.debug(f"node_synth: invoking synth llm for final answer; msgs_preview(last {len(preview)}): {preview}")
+        except Exception:
+            logger.exception("node_synth: error building synth preview")
+
         logger.debug("node_synth: invoking synth llm for final answer")
         try:
             resp = synth.invoke(msgs)
@@ -443,12 +526,17 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
     )
     wf.add_edge("call_tool", "planner")
 
-    app = wf.compile()
+    # compile the workflow; if a checkpointer (e.g. InMemorySaver) is provided, pass it so
+    # LangGraph will checkpoint state per-node during execution and support thread-scoped memory.
+    if checkpointer is not None:
+        app = wf.compile(checkpointer=checkpointer)
+    else:
+        app = wf.compile()
     logger.info("built langgraph agent (simple flow)")
     return app
 
 
-async def invoke_agent(agent_app, user_message: str, chat_history: List[BaseMessage]) -> str:
+async def invoke_agent(agent_app, user_message: str, chat_history: List[BaseMessage], config: Optional[Dict[str, Any]] = None) -> str:
     """Run the LangGraph agent astream and return the final AI response text.
 
     Behavior:
@@ -490,7 +578,17 @@ async def invoke_agent(agent_app, user_message: str, chat_history: List[BaseMess
                 logger.exception("_extract_messages_from error")
             return found
 
-        agen = agent_app.astream(initial_state)
+        # If a config is provided (per LangGraph tutorial this should include
+        # {'configurable': {'thread_id': <id>}}), pass it as the second positional
+        # argument to the astream() call so the checkpointer can scope memory by thread.
+        try:
+            if config is not None:
+                agen = agent_app.astream(initial_state, config)
+            else:
+                agen = agent_app.astream(initial_state)
+        except TypeError:
+            # fallback: some compiled apps may not accept config on astream; try without it
+            agen = agent_app.astream(initial_state)
         try:
             async for state in agen:
                 last_state = state
