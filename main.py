@@ -4,6 +4,14 @@ import logging
 import asyncio
 from typing import List, Any
 
+class OllamaWrapper:
+    def __init__(self, model_name: str = "llama3.2:1b", timeout: int = 90):
+        # Using a lightweight model by default
+        self.model = model_name
+        self.timeout = timeout
+        self._bound_tools = None
+        logger.info(f"OllamaWrapper initialized with model={model_name}, timeout={timeout}s")
+
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 from langchain_together import ChatTogether
 
@@ -71,10 +79,11 @@ if "mcp_session_context" not in st.session_state:
 
 
 class OllamaWrapper:
-    def __init__(self, model_name: str = "llama3.2:latest", timeout: int = 30):
+    def __init__(self, model_name: str = "mistral", timeout: int = 90):
         self.model = model_name
         self.timeout = timeout
         self._bound_tools = None
+        logger.info(f"OllamaWrapper initialized with model={model_name}, timeout={timeout}s")
 
     def _messages_to_prompt(self, messages: List[BaseMessage]) -> str:
         parts = []
@@ -116,17 +125,51 @@ Otherwise, output a normal textual answer without that JSON line.''',
                 timeout=self.timeout,
             )
             text = proc.stdout.strip()
-            # try to parse a single-line JSON object with tool_calls
+            # try to parse a JSON object with tool_calls
             tool_calls = None
             try:
-                # extract first JSON-looking substring
-                m = re.search(r"(\{\s*\"tool_calls\"[\s\S]*?\})", text)
-                if m:
-                    json_part = m.group(1)
-                    parsed = json.loads(json_part)
-                    tool_calls = parsed.get('tool_calls')
+                # Search for JSON content first
+                json_markers = [
+                    (r"```(?:json)?\s*(\{[\s\S]*?\"tool_calls\"[\s\S]*?\})\s*```", re.IGNORECASE),  # code fence
+                    (r"(\{[\s\S]*?\"tool_calls\"[\s\S]*?\})", 0),  # raw JSON
+                    (r"(?:Tool call required|Using tool|Call tool):[\s\n]*(\{[\s\S]*?\"tool_calls\"[\s\S]*?\})", re.IGNORECASE),  # with prefix
+                ]
+                
+                for pattern, flags in json_markers:
+                    m = re.search(pattern, text, flags)
+                    if m:
+                        json_part = m.group(1)
+                        try:
+                            parsed = json.loads(json_part)
+                            if 'tool_calls' in parsed:
+                                tool_calls = parsed['tool_calls']
+                                if tool_calls:  # if non-empty list
+                                    break
+                        except json.JSONDecodeError:
+                            continue
             except Exception:
                 tool_calls = None
+
+            # heuristic: if model mentions neo4j_vector_search in plain text, convert to a tool_call
+            if not tool_calls:
+                try:
+                    lower = text.lower()
+                    if "neo4j_vector_search" in lower or "vector_search" in lower:
+                        # try to extract a quoted query
+                        qmatch = re.search(r"neo4j_vector_search\s*\(\s*['\"]([^'\"]+)['\"]", text, re.IGNORECASE)
+                        if not qmatch:
+                            qmatch = re.search(r"query\s*[:=]\s*['\"]([^'\"]+)['\"]", text, re.IGNORECASE)
+                        if not qmatch:
+                            # fallback: use last line or whole prompt as query
+                            last_line = text.strip().splitlines()[-1]
+                            q = last_line.strip()[:200]
+                        else:
+                            q = qmatch.group(1)
+                        if q:
+                            tool_calls = [{"name": "neo4j_vector_search", "args": {"query": q, "k": 2}}]
+                            logger.debug(f"OllamaWrapper heuristic created tool_call for neo4j_vector_search with query: {q}")
+                except Exception:
+                    tool_calls = None
 
             class Resp:
                 pass
@@ -339,7 +382,7 @@ async def setup_agent_and_mcp(uploaded_file_data, llm_agent, indexer_instance, e
         filtered_mcp_tools = [t for t in loaded_mcp_tools if t.name in ["read_neo4j_cypher", "get_neo4j_schema"]]
 
         # costruisci agente langgraph con planner locale (Ollama) per planning e Together per la synth finale
-        planner = OllamaWrapper(model_name=os.getenv("OLLAMA_MODEL", "llama3.2:latest"), timeout=int(os.getenv("OLLAMA_TIMEOUT", "20")))
+        planner = OllamaWrapper(model_name=os.getenv("OLLAMA_MODEL", "llama3.2:1b"), timeout=int(os.getenv("OLLAMA_TIMEOUT", "90")))
         synth = st.session_state.llm_agent
 
         st.session_state.agent_app = _build_agent_workflow(
@@ -465,7 +508,7 @@ if st.session_state.pdf_uploaded and st.session_state.agent_app:
                                 invoke_agent(
                                     st.session_state.agent_app, user_message, st.session_state.chat_history
                                 ),
-                                timeout=90,
+                                timeout=180,
                             )
                         )
                     except asyncio.TimeoutError:
@@ -473,6 +516,7 @@ if st.session_state.pdf_uploaded and st.session_state.agent_app:
                         response_content = direct_vector_qa(
                             user_message, st.session_state.indexer, st.session_state.llm_agent
                         )
+                    # original behavior: no checkpoint recovery, let invoke_agent results surface
 
                     logger.debug(f"invoke_agent returned: {response_content}")
                     if not response_content:
