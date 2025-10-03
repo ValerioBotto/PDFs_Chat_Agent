@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import time
 import uuid
 import logging
@@ -129,13 +130,17 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
     # node: firewall - validate user query
     def node_firewall(state: Dict[str, Any]) -> Dict[str, Any]:
         q = state.get("question", "")
-        logger.debug("node_firewall: running firewall_check")
+        logger.info(f"node_firewall: START - running firewall_check for question='{q}'")
+        logger.debug(f"node_firewall: state keys={list(state.keys())}")
         try:
             # prefer invoke to avoid deprecated __call__ behavior; fall back to direct call
             if hasattr(firewall_check, "invoke"):
+                logger.debug("node_firewall: using firewall_check.invoke()")
                 res_obj = firewall_check.invoke({"query": q})
+                logger.debug(f"node_firewall: firewall_check.invoke() returned {type(res_obj)}")
                 # handle coroutine
                 if hasattr(res_obj, "__await__"):
+                    logger.debug("node_firewall: handling coroutine response")
                     loop = asyncio.new_event_loop()
                     try:
                         res_obj = loop.run_until_complete(res_obj)
@@ -145,22 +150,41 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
                         except Exception:
                             pass
                 res = getattr(res_obj, "content", None) or str(res_obj)
+                logger.info(f"node_firewall: firewall_check result='{res}'")
             else:
+                logger.debug("node_firewall: using direct firewall_check() call")
                 res = firewall_check(q)
+                logger.info(f"node_firewall: firewall_check result='{res}'")
         except Exception as e:
             logger.exception("firewall_check error")
             res = "reject"
+        
+        logger.debug(f"node_firewall: checking if result '{res}' starts with 'reject'")
         if isinstance(res, str) and res.startswith("reject"):
             # immediate final answer
+            logger.info("node_firewall: REJECT - returning rejection message")
             final = AIMessage(content="your query was rejected by the firewall")
             return {"chat_history": state.get("chat_history", []) + [final]}
+        
         # approved -> continue to presearch
-        return {"chat_history": state.get("chat_history", []), "question": q, "approved": True}
+        logger.info("node_firewall: APPROVE - continuing to presearch")
+        result = {
+            "chat_history": state.get("chat_history", []), 
+            "question": q, 
+            "intermediate_steps": state.get("intermediate_steps", []),
+            "approved": True
+        }
+        logger.info(f"node_firewall: returning state with question='{result.get('question', '')}' and keys={list(result.keys())}")
+        return result
 
     # node: presearch - mandatory neo4j_vector_search using the user query
     def node_presearch(state: Dict[str, Any]) -> Dict[str, Any]:
         q = state.get("question", "")
-        logger.debug("node_presearch: performing mandatory neo4j_vector_search")
+        logger.info(f"node_presearch: START - performing mandatory neo4j_vector_search for question='{q}'")
+        logger.debug(f"node_presearch: state keys={list(state.keys())}")
+        if not q or not q.strip():
+            logger.error(f"node_presearch: question is empty or invalid! Full state={state}")
+            return {"chat_history": state.get("chat_history", []), "question": q}
         try:
             # prefer invoke to avoid BaseTool.__call__ kwargs issues
             logger.debug(f"node_presearch: calling neo4j_vector_search with q={q[:120].replace('\n',' ')}")
@@ -182,18 +206,34 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
         except Exception:
             logger.exception("presearch failed")
             res = "error"
-        # add tool output as ToolMessage
+        # add tool output as ToolMessage; include the original query as metadata so
+        # downstream nodes can detect whether the presearch corresponds to the
+        # current question (this helps when the compiled graph resumes mid-flow).
         try:
             out_str = getattr(res, "content", None) or str(res)
         except Exception:
             out_str = str(res)
-        tm = ToolMessage(content=out_str, tool_call_id=f"presearch-{uuid.uuid4().hex[:8]}")
+        try:
+            meta = json.dumps({"q": q}, ensure_ascii=False)
+            tm_content = f"__PRESEARCH__{meta}\n{out_str}"
+        except Exception:
+            tm_content = f"__PRESEARCH__{json.dumps({'q': str(q)})}\n{out_str}"
+        tm = ToolMessage(content=tm_content, tool_call_id=f"presearch-{uuid.uuid4().hex[:8]}")
         logger.debug(f"node_presearch: appended ToolMessage with id={tm.tool_call_id} content_preview={out_str[:200].replace('\n',' ')}")
-        return {"chat_history": state.get("chat_history", []) + [tm], "question": q}
+        result = {
+            "chat_history": state.get("chat_history", []) + [tm], 
+            "question": q,
+            "intermediate_steps": state.get("intermediate_steps", [])
+        }
+        logger.info(f"node_presearch: returning state with question='{result.get('question', '')}' and keys={list(result.keys())}")
+        return result
 
     # node: planner - ask ollama whether more tools are needed
     def node_planner(state: Dict[str, Any]) -> Dict[str, Any]:
         q = state.get("question", "")
+        logger.debug(f"node_planner: processing question='{q}', state_keys={list(state.keys())}")
+        if not q or not q.strip():
+            logger.error(f"node_planner: question is empty! Full state={state}")
         # build a strict prompt: planner MUST output a single JSON object and nothing else
         # include a precise list of allowed tool names to reduce hallucination of tools
         allowed_tools_list = ", ".join([getattr(t, 'name', None) or getattr(t, '__name__', str(t)) for t in tools])
@@ -250,6 +290,39 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
 
         logger.info(f"node_planner: text={text[:400].replace('\n',' ')} parsed_calls={repr(parsed_calls)[:800]}")
 
+        # Defensive check: ensure that the latest presearch ToolMessage corresponds
+        # to the current question. If the compiled app resumed mid-flow, the last
+        # presearch may refer to a previous question and should not be trusted.
+        try:
+            chat = state.get("chat_history", []) or []
+            # look for last ToolMessage whose content starts with our __PRESEARCH__ marker
+            last_presearch_q = None
+            for item in reversed(chat):
+                if isinstance(item, ToolMessage) and isinstance(getattr(item, 'content', ''), str):
+                    c = item.content
+                    if c.startswith("__PRESEARCH__"):
+                        # content format: __PRESEARCH__<json_metadata>\n<tool_output>
+                        try:
+                            meta_part = c.split('\n', 1)[0][len("__PRESEARCH__"):]
+                            md = json.loads(meta_part)
+                            last_presearch_q = md.get('q')
+                        except Exception:
+                            last_presearch_q = None
+                        break
+            if last_presearch_q is not None:
+                # if mismatch, force a fresh neo4j_vector_search step
+                current_question = q or state.get("question", "")
+                if current_question and current_question.strip() and str(last_presearch_q).strip() != str(current_question).strip():
+                    logger.info(f"node_planner: last presearch query '{last_presearch_q[:50]}' does not match current question '{current_question[:50]}'; forcing neo4j_vector_search intermediate step")
+                    forced_tid = f"tc-forced-{uuid.uuid4().hex[:8]}"
+                    forced_step = {"name": "neo4j_vector_search", "args": {"query": current_question, "k": DEFAULT_K}, "id": forced_tid}
+                    return {"chat_history": state.get("chat_history", []), "intermediate_steps": [forced_step]}
+                elif not current_question or not current_question.strip():
+                    logger.error(f"node_planner: current question is empty, cannot force search. last_presearch_q='{last_presearch_q}', state={state}")
+        except Exception:
+            # be permissive: on any error fall back to planner normal behavior
+            logger.exception("node_planner: error while validating last presearch metadata")
+
         # if no tool calls, decide how to proceed:
         if not parsed_calls:
             # if planner emitted pure JSON (e.g. {"tool_calls": []}) we don't want to show that raw JSON
@@ -273,7 +346,12 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
                 # planner returned only JSON or contained a JSON fragment — do not append raw
                 # planner JSON/text to user chat. Proceed to synth using context.
                 logger.info("node_planner: planner returned JSON-only or contained JSON fragment; proceeding to synth without exposing raw planner text")
-                return {"chat_history": state.get("chat_history", []), "synth": True}
+                return {
+                    "chat_history": state.get("chat_history", []), 
+                    "question": q,
+                    "intermediate_steps": state.get("intermediate_steps", []),
+                    "synth": True
+                }
 
             # otherwise store planner textual rationale as AIMessage and signal synth
             am = AIMessage(content=text)
@@ -319,6 +397,9 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
                 available_names.add(tn)
             except Exception:
                 continue
+        
+        logger.debug(f"node_planner: available tool names: {sorted(available_names)}")
+        logger.debug(f"node_planner: normalized tool calls before filtering: {[item.get('name') for item in normalized]}")
 
         filtered = []
         for item in normalized:
@@ -326,7 +407,7 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
             if nm in available_names:
                 filtered.append(item)
             else:
-                logger.warning(f"node_planner: planner requested unknown or disallowed tool '{item.get('name')}', ignoring it")
+                logger.warning(f"node_planner: planner requested unknown or disallowed tool '{item.get('name')}', ignoring it (available: {sorted(available_names)})")
 
         if not filtered:
             # no valid tool calls -> instead of proceeding directly to synth, force a
@@ -335,16 +416,21 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
             # cycle (presearch already ran before planner, but planner may choose
             # to synth without executing further tools; forcing here guarantees
             # an additional tool execution pass when the planner didn't request any).
-            logger.info("node_planner: no valid tool_calls after filtering; forcing neo4j_vector_search intermediate step for current question")
+            current_question = q or state.get("question", "")
+            logger.info(f"node_planner: no valid tool_calls after filtering; forcing neo4j_vector_search intermediate step for current question: '{current_question[:100]}'")
             try:
                 forced_tid = f"tc-forced-{uuid.uuid4().hex[:8]}"
-                forced_step = {"name": "neo4j_vector_search", "args": {"query": q, "k": DEFAULT_K}, "id": forced_tid}
+                forced_step = {"name": "neo4j_vector_search", "args": {"query": current_question, "k": DEFAULT_K}, "id": forced_tid}
                 return {"chat_history": state.get("chat_history", []), "intermediate_steps": [forced_step]}
             except Exception:
                 logger.exception("node_planner: failed to create forced intermediate step; falling back to synth")
                 return {"chat_history": state.get("chat_history", []), "synth": True}
 
-        return {"chat_history": state.get("chat_history", []), "intermediate_steps": filtered}
+        return {
+            "chat_history": state.get("chat_history", []), 
+            "question": q,
+            "intermediate_steps": filtered
+        }
 
     # node: call_tool - execute one tool call (the last in intermediate_steps)
     def node_call_tool(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -385,7 +471,14 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
         # previous queries or embedded JSON from causing repeated/incorrect searches.
         try:
             if isinstance(name, str) and "neo4j_vector_search" in name.lower():
-                args["query"] = state.get("question", args.get("query", "")) or ""
+                current_question = state.get("question", "")
+                if current_question and current_question.strip():
+                    args["query"] = current_question
+                    logger.debug(f"node_call_tool: enforcing current question for {name}: '{current_question[:100]}'")
+                elif not args.get("query", "").strip():
+                    # fallback if no current question and no valid query in args
+                    args["query"] = "dispositivo funzionalità"  # generic fallback
+                    logger.warning(f"node_call_tool: no valid query for {name}, using generic fallback")
         except Exception:
             logger.exception("node_call_tool: failed to enforce current question for neo4j_vector_search")
 
@@ -436,10 +529,29 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
 
         # ensure ToolMessage content is a string (avoid passing complex objects)
         out_str = getattr(out, "content", None) or str(out)
-        tm = ToolMessage(content=out_str, tool_call_id=tid)
+        # If this was a forced neo4j_vector_search intermediate step (planner forced
+        # a search because the last presearch didn't match the current question),
+        # tag the ToolMessage as a PRESEARCH with metadata so downstream planner
+        # sees that a fresh presearch for the current question has been performed.
+        try:
+            tm_content = out_str
+            if isinstance(name, str) and "neo4j_vector_search" in name.lower() and isinstance(tid, str) and tid.startswith("tc-forced-"):
+                try:
+                    meta = json.dumps({"q": state.get("question", "")}, ensure_ascii=False)
+                    tm_content = f"__PRESEARCH__{meta}\n{out_str}"
+                except Exception:
+                    # fallback to plain output if metadata creation fails
+                    tm_content = out_str
+        except Exception:
+            tm_content = out_str
+        tm = ToolMessage(content=tm_content, tool_call_id=tid)
         # append tool output and remove the executed intermediate step
         new_steps = steps[:-1]
-        return {"chat_history": state.get("chat_history", []) + [tm], "intermediate_steps": new_steps}
+        return {
+            "chat_history": state.get("chat_history", []) + [tm], 
+            "question": state.get("question", ""),
+            "intermediate_steps": new_steps
+        }
 
     # node: synth - call together once with consolidated context
     def node_synth(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -450,12 +562,31 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
         MAX_HISTORY = 40
         context = chat[-MAX_HISTORY:]
         # build prompt: system + context
+        # Build adaptive guidance: avoid repeating identical generic disclaimer unless truly no new info.
+        recent_tool_txt = []
+        for m in reversed(context):
+            if isinstance(m, ToolMessage):
+                c = getattr(m, 'content', '') or ''
+                recent_tool_txt.append(c)
+            if len(recent_tool_txt) >= 6:
+                break
+        tool_corpus = "\n".join(recent_tool_txt).lower()
+        has_programming = any(k in tool_corpus for k in ["prog_", "programma", "programmazione", "settimana", "giorno", "menu", "memoria", "modalità permanente", "manuale"])        
+        holiday_hint = ""
+        if has_programming:
+            holiday_hint = (
+                "Se la domanda riguarda periodi di vacanza o sospensione, spiega come l'utente potrebbe simulare un 'periodo vacanza' usando la logica di programmazione disponibile (PROG_XX, modalità permanente, manuale, priorità) anche se la parola 'vacanza' non compare esplicitamente. "
+            )
         system = (
             "You are a helpful assistant specialized in answering questions about a document given a conversation history and retrieved document chunks. "
-            "Always prioritize the last user's question and answer it directly using the provided context. "
-            "Use facts mentioned earlier in the conversation (for example, if the user said 'mi chiamo <name>' use that name when addressing them). "
-            "Cite chunk numbers where appropriate. If the information is not present in the provided chunks or conversation, state that you cannot answer and avoid inventing facts. "
-            "If the same question was already fully answered earlier, do not repeat verbatim the previous full answer; instead, acknowledge the previous answer and provide only new information or clarify what is missing."
+            "MOST IMPORTANT: Always prioritize and directly answer ONLY the CURRENT user's question with a fresh answer. "
+            "Do NOT just repeat an earlier generic disclaimer if the chunks contain any partial clues. "
+            "If previous answers were generic and there are now chunks mentioning scheduling (PROG_XX, programmazione, settimane, orari), infer and describe plausible configuration steps without inventing hardware that is not in chunks. "
+            + holiday_hint +
+            "Use facts mentioned earlier in the conversation (for example, if the user said 'mi chiamo <name>' use that name). "
+            "Cite chunk numbers where appropriate using the format (chunk:chunk_id). "
+            "If genuinely no relevant chunk content exists for the specific aspect, say so briefly and then offer what related capabilities ARE documented. "
+            "Never repeat the exact same sentence structure as a previous answer unless it is a factual citation."
         )
         # Ensure the user's current question is included explicitly as the last HumanMessage
         try:
@@ -517,7 +648,11 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
     wf.set_entry_point("firewall")
 
     # transitions: firewall -> presearch -> planner -> either call_tool or synth
-    wf.add_edge("firewall", "presearch")
+    wf.add_conditional_edges(
+        "firewall",
+        lambda s: "presearch" if s.get("approved") else END,
+        {"presearch": "presearch", END: END},
+    )
     wf.add_edge("presearch", "planner")
     wf.add_conditional_edges(
         "planner",
@@ -525,6 +660,7 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
         {"call_tool": "call_tool", "synth": "synth"},
     )
     wf.add_edge("call_tool", "planner")
+    wf.add_edge("synth", END)
 
     # compile the workflow; if a checkpointer (e.g. InMemorySaver) is provided, pass it so
     # LangGraph will checkpoint state per-node during execution and support thread-scoped memory.
@@ -548,6 +684,14 @@ async def invoke_agent(agent_app, user_message: str, chat_history: List[BaseMess
     initial_state = {"chat_history": chat_history or [], "question": user_message, "intermediate_steps": []}
     final_response = ""
     agen = None
+    
+    # Debug logging for follow-up question tracking
+    logger.info(f"invoke_agent: processing question='{user_message}' with {len(chat_history or [])} messages in chat_history")
+    if chat_history:
+        last_msg = chat_history[-1] if chat_history else None
+        if isinstance(last_msg, (HumanMessage, AIMessage)):
+            logger.debug(f"invoke_agent: last message type={type(last_msg).__name__} content='{getattr(last_msg, 'content', '')[:100]}'")
+    logger.debug(f"invoke_agent: initial_state keys={list(initial_state.keys())}")
     try:
         last_state = None
         accumulated: List[BaseMessage] = list(initial_state.get("chat_history", []))
@@ -555,88 +699,115 @@ async def invoke_agent(agent_app, user_message: str, chat_history: List[BaseMess
 
         def _extract_messages_from(obj) -> List[BaseMessage]:
             found: List[BaseMessage] = []
-            try:
-                if obj is None:
-                    return found
-                if isinstance(obj, BaseMessage):
-                    found.append(obj)
-                    return found
-                if isinstance(obj, dict):
-                    ch = obj.get("chat_history")
-                    if ch:
-                        for item in ch:
-                            found.extend(_extract_messages_from(item))
-                        return found
-                    for v in obj.values():
-                        found.extend(_extract_messages_from(v))
-                    return found
-                if isinstance(obj, (list, tuple)):
-                    for item in obj:
-                        found.extend(_extract_messages_from(item))
-                    return found
-            except Exception:
-                logger.exception("_extract_messages_from error")
+            if obj is None:
+                return found
+            if isinstance(obj, BaseMessage):
+                found.append(obj)
+                return found
+            if isinstance(obj, dict):
+                for v in obj.values():
+                    found.extend(_extract_messages_from(v))
+            if isinstance(obj, (list, tuple)):
+                for it in obj:
+                    found.extend(_extract_messages_from(it))
             return found
 
-        # If a config is provided (per LangGraph tutorial this should include
-        # {'configurable': {'thread_id': <id>}}), pass it as the second positional
-        # argument to the astream() call so the checkpointer can scope memory by thread.
+        # --- configure run (memory by default) ---
         try:
-            if config is not None:
-                agen = agent_app.astream(initial_state, config)
-            else:
+            resume_run = True
+            if config and config.get('fresh'):
+                resume_run = False
+        except Exception:
+            resume_run = True
+
+        if isinstance(config, dict):
+            cfg_to_use = config if 'configurable' in config else {'configurable': config}
+        else:
+            cfg_to_use = None
+        if not cfg_to_use:
+            cfg_to_use = {'configurable': {'thread_id': f"session-{uuid.uuid4().hex[:8]}"}}
+        if 'configurable' not in cfg_to_use or 'thread_id' not in cfg_to_use['configurable']:
+            cfg_to_use['configurable'] = {'thread_id': f"session-{uuid.uuid4().hex[:8]}"}
+
+        if resume_run:
+            try:
+                agen = agent_app.astream(initial_state, cfg_to_use)
+                logger.info(f"invoke_agent: running with persistent thread_id={cfg_to_use['configurable']['thread_id']}")
+            except TypeError:
+                logger.debug("agent_app.astream rejected config; falling back to no-config run")
                 agen = agent_app.astream(initial_state)
-        except TypeError:
-            # fallback: some compiled apps may not accept config on astream; try without it
-            agen = agent_app.astream(initial_state)
+        else:
+            fresh_cfg = {'configurable': {'thread_id': f"fresh-{int(time.time()*1000)}-{uuid.uuid4().hex[:6]}"}}
+            logger.info(f"invoke_agent: forcing fresh run with thread_id={fresh_cfg['configurable']['thread_id']}")
+            agen = agent_app.astream(initial_state, fresh_cfg)
+
+        merged_state: Dict[str, Any] = dict(initial_state)
+
         try:
-            async for state in agen:
-                last_state = state
-                logger.debug(f"invoke_agent: got state keys={list(state.keys()) if isinstance(state, dict) else type(state)}")
+            last_node_name = None
+            async for chunk in agen:
+                extracted: Dict[str, Any] = {}
+                if isinstance(chunk, dict):
+                    if 'values' in chunk and isinstance(chunk['values'], dict):
+                        extracted = chunk['values']
+                    else:
+                        if len(chunk.keys()) == 1:
+                            k, v = next(iter(chunk.items()))
+                            if isinstance(v, dict):
+                                extracted = v
+                                last_node_name = k
+                        if not extracted and any(k in chunk for k in ('chat_history','final_content','question','intermediate_steps')):
+                            extracted = chunk
+                            # try to infer a pseudo node name if one of the known keys missing
+                            if last_node_name is None and 'final_content' in chunk:
+                                last_node_name = 'synth'
+                elif isinstance(chunk, BaseMessage):
+                    extracted = {'chat_history': [chunk]}
 
-                # explicit final_content short-circuit
-                try:
-                    if isinstance(state, dict) and state.get("final_content"):
-                        final_response = state.get("final_content")
-                        logger.info("invoke_agent: detected final_content in state, returning it")
-                        break
-                except Exception:
-                    pass
+                if extracted:
+                    # question
+                    q_new = extracted.get('question')
+                    if isinstance(q_new, str) and q_new.strip():
+                        merged_state['question'] = q_new
+                    elif 'question' not in merged_state:
+                        merged_state['question'] = initial_state.get('question','')
+                    # chat history
+                    if 'chat_history' in extracted and isinstance(extracted['chat_history'], list):
+                        existing = merged_state.get('chat_history', [])
+                        for m in extracted['chat_history']:
+                            if not any((getattr(m,'content',None)==getattr(o,'content',None) and type(m)==type(o)) for o in existing):
+                                existing.append(m)
+                        merged_state['chat_history'] = existing
+                    # intermediate steps
+                    if 'intermediate_steps' in extracted:
+                        merged_state['intermediate_steps'] = extracted.get('intermediate_steps') or []
+                    # finals
+                    if 'final_content' in extracted:
+                        merged_state['final_content'] = extracted['final_content']
+                    if extracted.get('final_ai'):
+                        merged_state['final_ai'] = True
 
-                # accumulate any BaseMessage instances found in the emitted state
-                try:
-                    msgs = _extract_messages_from(state)
-                    if msgs:
-                        accumulated.extend(msgs)
-                    # debug preview
-                    preview = []
-                    for m in accumulated[-5:]:
-                        t = type(m).__name__
-                        c = getattr(m, "content", None) or str(m)
-                        preview.append(f"{t}:{c[:120].replace('\n',' ')}")
-                    logger.debug(f"invoke_agent: accumulated chat_history preview (last {len(preview)}): {preview}")
-                except Exception:
-                    logger.exception("invoke_agent: error while building accumulated preview")
+                last_state = dict(merged_state)
+                logger.info(f"invoke_agent: merged_state keys={list(merged_state.keys())}")
+                logger.info(f"invoke_agent: merged_state.question='{merged_state.get('question','')}' chat_len={len(merged_state.get('chat_history',[]))}")
 
-                # check whether new AIMessage(s) appeared during this run
+                # accumulate messages for fallback detection
                 try:
-                    total_ai_now = sum(1 for m in accumulated if isinstance(m, AIMessage))
-                    if total_ai_now > pre_existing_ai_count:
-                        for m in reversed(accumulated):
-                            if isinstance(m, AIMessage):
-                                final_response = getattr(m, "content", None) or str(m)
-                                break
-                        if final_response:
-                            break
+                    if extracted:
+                        msgs = _extract_messages_from(extracted)
+                        if msgs:
+                            accumulated.extend(msgs)
                 except Exception:
-                    logger.exception("invoke_agent: error while detecting AIMessage")
-                    # fall back to scanning for last AIMessage
-                    for m in reversed(accumulated):
-                        if isinstance(m, AIMessage):
-                            final_response = getattr(m, "content", None) or str(m)
-                            break
-                    if final_response:
-                        break
+                    logger.exception("invoke_agent: error accumulating messages")
+
+                if merged_state.get('final_content'):
+                    final_response = merged_state.get('final_content')
+                    logger.info("invoke_agent: final_content detected -> stopping loop")
+                    break
+
+                # We intentionally DO NOT early-stop on generic AIMessage appearances
+                # to avoid cutting the flow before presearch/planner/synth complete.
+                # Only final_content (set by synth or firewall rejection) terminates the loop.
         finally:
             try:
                 if agen is not None and hasattr(agen, "aclose"):
