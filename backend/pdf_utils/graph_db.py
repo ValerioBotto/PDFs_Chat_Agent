@@ -225,7 +225,7 @@ class GraphDB:
             
         return self.run_query(query, params)
     
-    def query_vector_index(self, index_name: str, query_embedding: List[float], k: int = 5) -> List[Dict[str, Any]]:
+    def query_vector_index(self, index_name: str, query_embedding: List[float], k: int = 5, filename: Any = None) -> List[Dict[str, Any]]:
         """
         esegue una ricerca di similarità vettoriale sull'indice neo4j.
         restituisce una lista di dizionari contenenti il contenuto del nodo
@@ -233,12 +233,23 @@ class GraphDB:
         """
         #la procedura db.index.vector.queryNodes è il modo per interrogare indici vettoriali
         #in Neo4j.
-        query = f"""
-        CALL db.index.vector.queryNodes('{index_name}', {k}, $query_embedding)
-        YIELD node, score
-        RETURN node.content AS node_content, score, node.chunk_id AS chunk_id, node.section AS section
-        """
-        parameters = {"query_embedding": query_embedding}
+        # Support optional scoping by document filename to avoid cross-document leakage
+        if filename:
+            query = f"""
+            CALL db.index.vector.queryNodes('{index_name}', {k}, $query_embedding)
+            YIELD node, score
+            WITH node, score
+            MATCH (d:Document {{filename: $filename}})-[:HAS_CHUNK]->(node)
+            RETURN node.content AS node_content, score, node.chunk_id AS chunk_id, node.section AS section, d.filename AS filename
+            """
+            parameters = {"query_embedding": query_embedding, "filename": filename}
+        else:
+            query = f"""
+            CALL db.index.vector.queryNodes('{index_name}', {k}, $query_embedding)
+            YIELD node, score
+            RETURN node.content AS node_content, score, node.chunk_id AS chunk_id, node.section AS section, node.source AS filename
+            """
+            parameters = {"query_embedding": query_embedding}
         
         results = []
         try:
@@ -248,7 +259,8 @@ class GraphDB:
                         "node_content": record["node_content"],
                         "score": record["score"],
                         "chunk_id": record["chunk_id"],
-                        "section": record["section"]
+                        "section": record["section"],
+                        "filename": record["filename"],
                     })
             logger.debug(f"ricerca vettoriale su '{index_name}' ha trovato {len(results)} risultati.")
             return results

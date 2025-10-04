@@ -58,12 +58,14 @@ def _save_checkpoint(entry: Dict[str, Any]):
 # --- globals set at setup time ---
 _global_graph_db: Optional[GraphDB] = None
 _global_indexer: Optional[Indexer] = None
+_global_active_filename: Optional[str] = None
 
-def initialize_agent_tools_resources(graph_db: GraphDB, indexer: Indexer):
-    global _global_graph_db, _global_indexer
+def initialize_agent_tools_resources(graph_db: GraphDB, indexer: Indexer, active_filename: Optional[str] = None):
+    global _global_graph_db, _global_indexer, _global_active_filename
     _global_graph_db = graph_db
     _global_indexer = indexer
-    logger.debug("agent tools resources initialized")
+    _global_active_filename = active_filename
+    logger.debug(f"agent tools resources initialized (active_filename={active_filename})")
 
 
 # --- tools ---
@@ -78,22 +80,28 @@ def firewall_check(query: str) -> str:
     return "approve"
 
 
-@tool(description="neo4j_vector_search: run vector search on chunk index and return excerpts")
+@tool(description="neo4j_vector_search: run vector search on chunk index and return excerpts; scoped to current document when available")
 def neo4j_vector_search(query: str, k: int = DEFAULT_K) -> str:
     if _global_indexer is None or _global_graph_db is None:
         logger.error("neo4j_vector_search called before resources initialized")
         return "error: resources not initialized"
-    logger.info(f"neo4j_vector_search: searching for: {query} (k={k})")
+    logger.info(f"neo4j_vector_search: searching for: {query} (k={k}) filename_scope={_global_active_filename}")
     try:
         emb = _global_indexer.generate_embeddings(query)
-        results = _global_graph_db.query_vector_index("chunk_embeddings_index", emb, k=k)
+        # If we have an active filename, scope the vector search to that document to avoid cross-doc leakage
+        try:
+            results = _global_graph_db.query_vector_index("chunk_embeddings_index", emb, k=k, filename=_global_active_filename)
+        except TypeError:
+            # fallback for older GraphDB signature without filename param
+            results = _global_graph_db.query_vector_index("chunk_embeddings_index", emb, k=k)
         if not results:
             return "no_results"
         parts = []
         for i, r in enumerate(results, start=1):
             cid = r.get("chunk_id", "?")
+            src = r.get("filename") or "?"
             txt = r.get("node_content", "").replace("\n", " ")[:800]
-            parts.append(f"[{i}] (chunk:{cid}) {txt}")
+            parts.append(f"[{i}] (chunk:{cid} | file:{src}) {txt}")
         return "\n".join(parts)
     except Exception as e:
         logger.exception("neo4j_vector_search failed")
@@ -562,31 +570,24 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
         MAX_HISTORY = 40
         context = chat[-MAX_HISTORY:]
         # build prompt: system + context
-        # Build adaptive guidance: avoid repeating identical generic disclaimer unless truly no new info.
-        recent_tool_txt = []
-        for m in reversed(context):
-            if isinstance(m, ToolMessage):
-                c = getattr(m, 'content', '') or ''
-                recent_tool_txt.append(c)
-            if len(recent_tool_txt) >= 6:
-                break
-        tool_corpus = "\n".join(recent_tool_txt).lower()
-        has_programming = any(k in tool_corpus for k in ["prog_", "programma", "programmazione", "settimana", "giorno", "menu", "memoria", "modalità permanente", "manuale"])        
-        holiday_hint = ""
-        if has_programming:
-            holiday_hint = (
-                "Se la domanda riguarda periodi di vacanza o sospensione, spiega come l'utente potrebbe simulare un 'periodo vacanza' usando la logica di programmazione disponibile (PROG_XX, modalità permanente, manuale, priorità) anche se la parola 'vacanza' non compare esplicitamente. "
-            )
         system = (
             "You are a helpful assistant specialized in answering questions about a document given a conversation history and retrieved document chunks. "
-            "MOST IMPORTANT: Always prioritize and directly answer ONLY the CURRENT user's question with a fresh answer. "
-            "Do NOT just repeat an earlier generic disclaimer if the chunks contain any partial clues. "
-            "If previous answers were generic and there are now chunks mentioning scheduling (PROG_XX, programmazione, settimane, orari), infer and describe plausible configuration steps without inventing hardware that is not in chunks. "
-            + holiday_hint +
-            "Use facts mentioned earlier in the conversation (for example, if the user said 'mi chiamo <name>' use that name). "
-            "Cite chunk numbers where appropriate using the format (chunk:chunk_id). "
-            "If genuinely no relevant chunk content exists for the specific aspect, say so briefly and then offer what related capabilities ARE documented. "
-            "Never repeat the exact same sentence structure as a previous answer unless it is a factual citation."
+            "MOST IMPORTANT: Always prioritize and directly answer ONLY the CURRENT user's question with a fresh, concise, and contextually accurate answer. "
+            "Avoid filler phrases like 'Sure!', 'Here’s your answer based on the document', or similar introductions — respond directly. "
+            "Your goal is to provide clear, informative, and human-like answers grounded in the retrieved chunks. "
+            "If the chunks contain conflicting or ambiguous information, acknowledge the uncertainty briefly and summarize the most plausible interpretation. "
+            "If previous answers were generic, and new chunks provide partial clues, synthesize actionable insights grounded in those chunks without inventing unsupported details. "
+            "Always maintain a neutral, professional, and cooperative tone. "
+            "Use facts mentioned earlier in the conversation (for example, if the user said 'mi chiamo <name>', use that name naturally in your replies). "
+            "Cite chunk numbers where appropriate using the format (chunk:<chunk_id>) AT THE END of each relevant fact or quote. "
+            "When relevant, combine information across multiple chunks to build a coherent answer. "
+            "If genuinely no relevant chunk content exists for the specific aspect, say so briefly and then offer what related or adjacent information IS documented. "
+            "Never repeat the exact same sentence structure as a previous answer unless it is a factual citation. "
+            "When explaining technical or complex concepts, favor clarity and simplicity without losing accuracy. "
+            "Do not over-explain; assume the user has a basic understanding of the topic. "
+            "Avoid hallucinating: only include information explicitly present in the chunks or previously stated by the user. "
+            "If the user asks for summaries or step-by-step guidance, provide them in a structured but concise way. "
+            "Keep responses self-contained, so they make sense without needing to reread previous messages, but remain consistent with prior context. "
         )
         # Ensure the user's current question is included explicitly as the last HumanMessage
         try:

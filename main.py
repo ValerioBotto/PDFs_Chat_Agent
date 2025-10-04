@@ -238,7 +238,15 @@ def direct_vector_qa(user_question: str, indexer_instance: Indexer, llm_agent: C
 
         #2) ricerca su neo4j
         graph_db = GraphDB()
-        results = graph_db.query_vector_index("chunk_embeddings_index", query_embedding, k=top_k)
+        # If an uploaded filename is present in session, scope the search to avoid cross-document leakage
+        try:
+            active_filename = getattr(st.session_state, "uploaded_filename", None)
+        except Exception:
+            active_filename = None
+        try:
+            results = graph_db.query_vector_index("chunk_embeddings_index", query_embedding, k=top_k, filename=active_filename)
+        except TypeError:
+            results = graph_db.query_vector_index("chunk_embeddings_index", query_embedding, k=top_k)
 
         if not results:
             graph_db.close()
@@ -406,9 +414,9 @@ async def setup_agent_and_mcp(uploaded_file_data, llm_agent, indexer_instance, e
             checkpointer=memory,
         )
 
-        #inizializza risorse globali dei tool
+        #inizializza risorse globali dei tool, scoping all agent queries to the current uploaded document
         agent_graph_db = GraphDB()
-        initialize_agent_tools_resources(agent_graph_db, indexer_instance)
+        initialize_agent_tools_resources(agent_graph_db, indexer_instance, active_filename=st.session_state.uploaded_filename)
 
         st.session_state.pdf_uploaded = True
         st.success("documento elaborato e agente inizializzato")
