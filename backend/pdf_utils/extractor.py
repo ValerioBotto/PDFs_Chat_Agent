@@ -1,12 +1,12 @@
 # backend/pdf_utils/extractor.py
 
 import logging
-from typing import List, Dict, Any, Tuple
-from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
+from typing import List, Dict
+from langchain_core.prompts import PromptTemplate
 from langchain_together import ChatTogether
 from dotenv import load_dotenv
 import os
-import re
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -14,19 +14,19 @@ load_dotenv()
 TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY")
 
 class Extractor:
-    def __init__(self, llm_model_name: str = "meta-llama/Llama-3.3-70B-Instruct-Turbo-Free"): # Ho ripristinato il tuo modello originale
+    def __init__(self, llm_model_name: str = "meta-llama/Llama-3.3-70B-Instruct-Turbo-Free"):
         if not TOGETHER_API_KEY:
             raise ValueError("TOGETHER_API_KEY non è impostata nell'ambiente.")
         
         self.llm = ChatTogether(
             model=llm_model_name,
-            temperature=0.1, # temperatura bassa per risposte più consistenti e fattuali
+            temperature=0.1, #temperatura bassa per risposte più consistenti e fattuali
             together_api_key=TOGETHER_API_KEY,
             max_tokens=512
         )
         logger.info(f"LLM initialized for extraction with model: {llm_model_name}")
 
-        # prompt per estrarre topic
+        #prompt per estrarre topic
         self.topic_extraction_prompt = PromptTemplate(
             template="""
             Analizza il seguente testo e identifica un massimo di {max_topics} concetti principali (topic) che descrivono il contenuto. 
@@ -44,22 +44,16 @@ class Extractor:
             input_variables=["text", "max_topics"]
         )
 
-        # definizione dei tipi di entità che vogliamo estrarre, in inglese
-        # ho selezionato un sottoinsieme più gestibile e rilevante per documenti tecnici inizialmente.
-        # possiamo espanderlo in seguito.
+        #definizione dei tipi di entità che vogliamo estrarre, scritti in inglese
+
         self.selected_entity_types = [
             "Person", "Organization", "Location", "GPE", "DateTime", "Product",
             "Event", "URL", "Email", "Currency", "Percentage", "Address",
-            "CountryRegion", "Continent", "CulturalEvent", "NaturalEvent" # Aggiungo i nomi generici per copertura
+            "CountryRegion", "Continent", "CulturalEvent", "NaturalEvent"
         ]
         
-        # genera il prompt per l'estrazione di entità in base ai tipi selezionati
-        # la formattazione nel prompt deve essere esatta perché l'LLM la segua.
+        #genera il prompt per l'estrazione di entità in base ai tipi selezionati
         entity_format_guide = "\n".join([f"- {ent_type}: [Lista di entità di questo tipo]" for ent_type in self.selected_entity_types])
-
-        # La formattazione nel prompt deve essere esatta perché l'LLM la segua.
-        entity_format_guide = "\n".join([f"- {ent_type}: [Lista di entità di questo tipo]" for ent_type in self.selected_entity_types])
-
         self.entity_extraction_prompt = PromptTemplate(
             template=f"""
             Estrai dal seguente testo entità dei seguenti tipi:
@@ -78,18 +72,58 @@ class Extractor:
             input_variables=["text"]
         )
         
-        # dizionario di sinonimi (placeholder dinamico)
-        # in una fase successiva, potremmo caricare da neo4j o un altro storage
-        self.synonym_map = {
-            "automatizzazione": "automazione",
-            "sicurezza informatica": "sicurezza",
-            "codifica": "programmazione",
-            "installazione software": "installazione",
-            "manutenzione preventiva": "manutenzione",
-            "elettronica digitale": "elettronica",
-            "controllo qualità": "controllo"
-        }
-        logger.info("synonym map initialized (placeholder).")
+        # cache in memoria {synonym -> canonical} popolata da Neo4j/LLM
+        self.synonym_map: Dict[str, str] = {}
+        logger.info("synonym map initialized (empty cache; dynamic via Neo4j/LLM).")
+
+        # Prompt per indurre forma canonica + sinonimi (risposta SOLO JSON)
+        self.synonym_induction_prompt = PromptTemplate(
+            template=(
+                """
+                Dato un termine di topic e un estratto del documento, proponi una normalizzazione:
+                - canonical: forma canonica breve (lemma/base) del termine in italiano quando possibile
+                - synonyms: lista di sinonimi/varianti e traduzioni rilevanti (IT/EN), includendo il termine originale
+                Rispondi SOLO con un oggetto JSON valido, senza backtick e senza testo extra:
+                {{"canonical": "...", "synonyms": ["...", "..."]}}
+
+                Termine: {term}
+                Contesto (troncato): {context}
+                """
+            ).strip(),
+            input_variables=["term", "context"],
+        )
+
+        # riferimenti opzionali a Neo4j e filename attivo
+        self.graph_db = None
+        self.active_filename = None
+
+    def attach_graph(self, graph_db, active_filename: str | None = None):
+        """Collega Neo4j e carica la mappa sinonimi iniziale (scoped al documento se fornito)."""
+        self.graph_db = graph_db
+        self.active_filename = active_filename
+        try:
+            loaded = graph_db.load_synonym_map(active_filename)
+            self.synonym_map.update(loaded)
+            logger.info(f"loaded {len(loaded)} synonyms from Neo4j (filename_scope={active_filename})")
+        except Exception:
+            logger.exception("failed loading synonyms from Neo4j")
+
+    def _resolve_canonical_via_graph(self, term: str) -> str | None:
+        t = term.lower().strip()
+        # prima dalla mappa locale
+        if t in self.synonym_map:
+            return self.synonym_map[t]
+        # poi dal grafo
+        if self.graph_db:
+            try:
+                canon = self.graph_db.get_canonical_topic(t)
+                if canon:
+                    canon_l = canon.lower().strip()
+                    self.synonym_map[t] = canon_l
+                    return canon_l
+            except Exception:
+                logger.exception("get_canonical_topic error")
+        return None
 
     def _call_llm(self, prompt_template: PromptTemplate, **kwargs) -> str:
         """helper function to call LLM with a given prompt and parse response."""
@@ -103,21 +137,33 @@ class Extractor:
         return str(response)
 
     def extract_topics(self, text: str, max_topics: int = 5) -> List[str]:
-        """estrae topic da un testo usando l'llm e li normalizza."""
+        """estrae topic da un testo usando l'LLM e li normalizza (dinamicamente via Neo4j quando disponibile)."""
         raw_topics_str = self._call_llm(self.topic_extraction_prompt, text=text, max_topics=max_topics)
-        
+
         # pulisce e spacchetta i topic
         topics = [t.strip().lower() for t in raw_topics_str.split(',') if t.strip()]
-        
-        # filtra termini generici che l'llm potrebbe comunque aver incluso
+
+        # filtra termini generici che l'LLM potrebbe comunque aver incluso
         generic_terms = {"documento", "testo", "informazioni", "contenuto", "dati", "elemento", "parte", "sezione", "pdf", "file", "articolo"}
         topics = [t for t in topics if t not in generic_terms]
-        
-        # applica normalizzazione tramite sinonimi
-        normalized_topics = [self.synonym_map.get(t, t) for t in topics]
-        
-        # rimuove duplicati dopo la normalizzazione
-        return list(set(normalized_topics))
+
+        normalized: List[str] = []
+        for t in topics:
+            canon = self._resolve_canonical_via_graph(t)
+            if not canon:
+                # fallback alla mappa locale
+                canon = self.synonym_map.get(t)
+            if not canon:
+                # nuova conoscenza: chiedi all'LLM e persisti
+                canon = self._dynamic_synonym_update(t, context_text=text) or t
+            normalized.append(canon)
+
+        # rimuove duplicati e rispetta max_topics
+        unique_norm = []
+        for c in normalized:
+            if c not in unique_norm:
+                unique_norm.append(c)
+        return unique_norm[:max_topics]
 
     def extract_entities(self, text: str) -> Dict[str, List[str]]:
         """Estrae entità da un testo usando l'LLM."""
@@ -148,13 +194,50 @@ class Extractor:
 
     def _dynamic_synonym_update(self, new_topic: str, context_text: str = None):
         """
-        placeholder per una futura logica di aggiornamento dinamico dei sinonimi.
-        potrebbe coinvolgere:
-        1. query a neo4j per sinonimi esistenti.
-        2. chiamata a llm per suggerire sinonimi basati sul contesto.
-        3. persistenza dei nuovi sinonimi in neo4j.
+        Induce canonical+sinonimi via LLM e persiste in Neo4j; aggiorna la mappa locale.
         """
-        logger.debug(f"simulando aggiornamento dinamico sinonimi per: {new_topic}")
-        # in una vera implementazione, qui l'llm potrebbe suggerire sinonimi
-        # e questi verrebbero aggiunti a self.synonym_map e persistiti.
-        pass
+        try:
+            context = (context_text or "")[:2000]
+            resp = self._call_llm(self.synonym_induction_prompt, term=new_topic, context=context)
+            data = None
+            try:
+                data = json.loads(resp)
+            except Exception:
+                # tenta di estrarre l'ultimo oggetto JSON da testo rumoroso
+                import re
+                matches = re.findall(r"(\{[\s\S]*\})", resp)
+                for m in reversed(matches):
+                    try:
+                        data = json.loads(m)
+                        break
+                    except Exception:
+                        continue
+            if not isinstance(data, dict):
+                return None
+
+            canonical = str(data.get("canonical", "")).lower().strip()
+            syns = [s.lower().strip() for s in data.get("synonyms", []) if isinstance(s, str) and s.strip()]
+            base = new_topic.lower().strip()
+            if base and base not in syns:
+                syns.append(base)
+            if not canonical:
+                return None
+
+            # rimuovi sinonimi identici alla forma canonica
+            syns = [s for s in syns if s and s != canonical]
+
+            # persisti su Neo4j se disponibile
+            if self.graph_db and syns:
+                try:
+                    self.graph_db.add_synonyms(canonical, syns)
+                except Exception:
+                    logger.exception("add_synonyms error")
+
+            # aggiorna mappa in memoria
+            for s in syns:
+                self.synonym_map[s] = canonical
+
+            return canonical
+        except Exception:
+            logger.exception("dynamic synonym update failed")
+            return None

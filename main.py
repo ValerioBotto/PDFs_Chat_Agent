@@ -353,6 +353,12 @@ async def setup_agent_and_mcp(uploaded_file_data, llm_agent, indexer_instance, e
 
         indexer_instance.index_chunks_to_neo4j(st.session_state.uploaded_filename, chunks)
 
+        # collega l'Extractor al grafo e carica sinonimi dinamici
+        try:
+            extractor_instance.attach_graph(graph_db, st.session_state.uploaded_filename)
+        except Exception:
+            logger.exception("impossibile collegare l'extractor al grafo per i sinonimi dinamici")
+
         full_text = doc.text
         st.info("estrazione di topic ed entità dal documento...")
         topics = extractor_instance.extract_topics(full_text)
@@ -391,7 +397,9 @@ async def setup_agent_and_mcp(uploaded_file_data, llm_agent, indexer_instance, e
         loaded_mcp_tools = await load_mcp_tools(st.session_state.mcp_session)
         logger.info(f"tool MCP caricati: {[t.name for t in loaded_mcp_tools]}")
 
-        filtered_mcp_tools = [t for t in loaded_mcp_tools if t.name in ["read_neo4j_cypher", "get_neo4j_schema"]]
+        # esponi anche il tool di scrittura se disponibile (nome più comune: write_neo4j_cypher)
+        allowed_mcp_names = {"read_neo4j_cypher", "get_neo4j_schema", "write_neo4j_cypher", "neo4j_write_cypher"}
+        filtered_mcp_tools = [t for t in loaded_mcp_tools if t.name in allowed_mcp_names]
 
         # costruisci agente langgraph con planner locale (Ollama) per planning e Together per la synth finale
         planner = OllamaWrapper(model_name=os.getenv("OLLAMA_MODEL", "llama3.2:1b"), timeout=int(os.getenv("OLLAMA_TIMEOUT", "90")))
@@ -416,7 +424,13 @@ async def setup_agent_and_mcp(uploaded_file_data, llm_agent, indexer_instance, e
 
         #inizializza risorse globali dei tool, scoping all agent queries to the current uploaded document
         agent_graph_db = GraphDB()
-        initialize_agent_tools_resources(agent_graph_db, indexer_instance, active_filename=st.session_state.uploaded_filename)
+        # passa anche lo user_id (stesso usato per i nodi in Neo4j)
+        initialize_agent_tools_resources(
+            agent_graph_db,
+            indexer_instance,
+            active_filename=st.session_state.uploaded_filename,
+            user_id=user_id,
+        )
 
         st.session_state.pdf_uploaded = True
         st.success("documento elaborato e agente inizializzato")

@@ -43,6 +43,8 @@ class GraphDB:
             "CREATE CONSTRAINT IF NOT EXISTS FOR (d:Document) REQUIRE d.filename IS UNIQUE",
             "CREATE INDEX IF NOT EXISTS FOR (c:Chunk) ON (c.chunk_id)",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (t:Topic) REQUIRE t.name IS UNIQUE",
+            # sinonimi dinamici
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (s:Synonym) REQUIRE s.name IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (e:PERSONA) REQUIRE e.name IS UNIQUE", # per esempio, per un tipo di entità specifico
             "CREATE INDEX IF NOT EXISTS FOR (c:Chunk) ON (c.section)",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (e:Entity) REQUIRE (e.name, e.type) IS UNIQUE"
@@ -171,6 +173,86 @@ class GraphDB:
             params["filename"] = filename
         
         return self.run_query(query, params)
+
+    # ------- SINONIMI DINAMICI -------
+    def add_synonyms(self, canonical: str, synonyms: list[str]):
+        """Salva sinonimi collegandoli al Topic canonico."""
+        if not canonical or not synonyms:
+            return None
+        query = """
+        MERGE (t:Topic {name: toLower($canonical)})
+        ON CREATE SET t.created_at = datetime()
+        WITH t
+        UNWIND $synonyms AS syn
+        WITH t, toLower(syn) AS s
+        MERGE (sy:Synonym {name: s})
+        MERGE (sy)-[:SYNONYM_OF]->(t)
+        RETURN t
+        """
+        params = {
+            "canonical": canonical.strip(),
+            "synonyms": [s.strip() for s in synonyms if s and s.strip()],
+        }
+        return self.run_query(query, params)
+
+    def get_canonical_topic(self, name: str) -> str | None:
+        """Risolve un nome in un Topic canonico via match diretto o Synonym (case-insensitive)."""
+        if not name:
+            return None
+        query = """
+        WITH toLower($name) AS n
+        OPTIONAL MATCH (t:Topic)
+        WHERE toLower(t.name) = n
+        WITH n, t
+        OPTIONAL MATCH (s:Synonym {name: n})-[:SYNONYM_OF]->(t2:Topic)
+        RETURN coalesce(t.name, t2.name) AS canon
+        LIMIT 1
+        """
+        rows = self.run_query(query, {"name": name})
+        try:
+            for r in rows:
+                try:
+                    # neo4j.Record supports key-based access
+                    canon = r["canon"] if "canon" in r.keys() else r[0]
+                except Exception:
+                    canon = None
+                if canon:
+                    return str(canon)
+        except Exception:
+            pass
+        return None
+
+    def load_synonym_map(self, filename: str | None = None) -> dict[str, str]:
+        """Ritorna {synonym -> canonical}. Se filename è dato, include solo sinonimi dei topic collegati a quel documento."""
+        if filename:
+            query = """
+            MATCH (d:Document {filename: $filename})-[:HAS_TOPIC]->(t:Topic)
+            OPTIONAL MATCH (s:Synonym)-[:SYNONYM_OF]->(t)
+            RETURN toLower(s.name) AS syn, toLower(t.name) AS canon
+            """
+            params = {"filename": filename}
+        else:
+            query = """
+            OPTIONAL MATCH (t:Topic)<-[:SYNONYM_OF]-(s:Synonym)
+            RETURN toLower(s.name) AS syn, toLower(t.name) AS canon
+            """
+            params = {}
+
+        rows = self.run_query(query, params)
+        out: dict[str, str] = {}
+        try:
+            for r in rows:
+                try:
+                    syn = r["syn"] if "syn" in r.keys() else r[0]
+                    canon = r["canon"] if "canon" in r.keys() else r[1]
+                except Exception:
+                    syn = None
+                    canon = None
+                if syn and canon:
+                    out[str(syn)] = str(canon)
+        except Exception:
+            pass
+        return out
 
     def add_entity_to_neo4j(self, entity_type: str, entity_name: str, filename: str = None, chunk_id: str = None):
         """
