@@ -1,13 +1,8 @@
-# backend/pdf_utils/graph_db.py
-
 from neo4j import GraphDatabase, exceptions # importa anche exceptions
 import logging
 import os
-import hashlib
-import datetime
 from typing import List, Dict, Any
 
-# setup logging per debug
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -35,9 +30,9 @@ class GraphDB:
             return result
 
     def create_indexes(self):
-        # crea indici e vincoli per migliorare le performance
+        #crea indici e vincoli per migliorare le performance
         
-        # Lista di query per vincoli/indici che potrebbero causare errori se ricreati
+        #Lista di query per vincoli/indici che potrebbero causare errori se ricreati
         index_queries = [
             "CREATE CONSTRAINT IF NOT EXISTS FOR (u:User) REQUIRE u.id IS UNIQUE",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (d:Document) REQUIRE d.filename IS UNIQUE",
@@ -45,7 +40,7 @@ class GraphDB:
             "CREATE CONSTRAINT IF NOT EXISTS FOR (t:Topic) REQUIRE t.name IS UNIQUE",
             # sinonimi dinamici
             "CREATE CONSTRAINT IF NOT EXISTS FOR (s:Synonym) REQUIRE s.name IS UNIQUE",
-            "CREATE CONSTRAINT IF NOT EXISTS FOR (e:PERSONA) REQUIRE e.name IS UNIQUE", # per esempio, per un tipo di entità specifico
+            "CREATE CONSTRAINT IF NOT EXISTS FOR (e:PERSONA) REQUIRE e.name IS UNIQUE", #per esempio, per un tipo di entità specifico
             "CREATE INDEX IF NOT EXISTS FOR (c:Chunk) ON (c.section)",
             "CREATE CONSTRAINT IF NOT EXISTS FOR (e:Entity) REQUIRE (e.name, e.type) IS UNIQUE"
         ]
@@ -68,7 +63,6 @@ class GraphDB:
         
         logger.info("indici e vincoli neo4j verificati/creati.")
     
-    # ... il resto del file rimane invariato ...
     def create_user(self, user_id):
         query = """
         MERGE (u:User {id: $user_id})
@@ -212,7 +206,6 @@ class GraphDB:
         try:
             for r in rows:
                 try:
-                    # neo4j.Record supports key-based access
                     canon = r["canon"] if "canon" in r.keys() else r[0]
                 except Exception:
                     canon = None
@@ -258,13 +251,12 @@ class GraphDB:
         """
         crea un nodo Entity con una proprietà 'type' e lo collega a un Documento/Chunk.
         """
-        # Creiamo un nodo generico :Entity e usiamo la proprietà 'type' per il tipo specifico
+        #Creiamo un nodo generico :Entity e usiamo la proprietà 'type' per il tipo specifico
         query = f"""
         MERGE (e:Entity {{name: $entity_name, type: $entity_type_prop}})
         ON CREATE SET e.created_at = datetime()
         ON MATCH SET e.last_updated = datetime()
         """
-        # Usiamo entity_type_prop per evitare conflitti con la variabile entity_type
         params = {"entity_name": entity_name, "entity_type_prop": entity_type} 
 
         if filename:
@@ -275,9 +267,7 @@ class GraphDB:
             """
             params["filename"] = filename
         
-        if chunk_id: # Colleghiamo solo se il chunk esiste e ha senso
-            # Se un'entità è estratta dal testo completo, il collegamento ai chunk potrebbe essere eccessivo
-            # o gestire solo l'entità primaria. Valutare se questo collegamento è sempre desiderabile.
+        if chunk_id: #Colleghiamo solo se il chunk esiste e ha senso
             query += """
             WITH e
             MATCH (c:Chunk {chunk_id: $chunk_id})
@@ -313,9 +303,7 @@ class GraphDB:
         restituisce una lista di dizionari contenenti il contenuto del nodo
         e il punteggio di similarità.
         """
-        #la procedura db.index.vector.queryNodes è il modo per interrogare indici vettoriali
-        #in Neo4j.
-        # Support optional scoping by document filename to avoid cross-document leakage
+        #procedura db.index.vector.queryNodes per interrogare indici vettoriali in Neo4j.
         if filename:
             query = f"""
             CALL db.index.vector.queryNodes('{index_name}', {k}, $query_embedding)

@@ -98,13 +98,30 @@ class Extractor:
         self.active_filename = None
 
     def attach_graph(self, graph_db, active_filename: str | None = None):
-        """Collega Neo4j e carica la mappa sinonimi iniziale (scoped al documento se fornito)."""
+        """Collega Neo4j e carica la mappa sinonimi iniziale.
+
+        Strategia di preload:
+        - Carica prima i sinonimi globali (tutti i documenti)
+        - Se viene passato un filename attivo, carica anche i sinonimi specifici del documento
+          sovrascrivendo eventuali collisioni (priorità al documento corrente).
+        """
         self.graph_db = graph_db
         self.active_filename = active_filename
         try:
-            loaded = graph_db.load_synonym_map(active_filename)
-            self.synonym_map.update(loaded)
-            logger.info(f"loaded {len(loaded)} synonyms from Neo4j (filename_scope={active_filename})")
+            # preload global synonyms
+            global_loaded = graph_db.load_synonym_map(None)
+            if isinstance(global_loaded, dict):
+                self.synonym_map.update(global_loaded)
+            # then document-scoped to override globals when needed
+            doc_loaded = {}
+            if active_filename:
+                doc_loaded = graph_db.load_synonym_map(active_filename)
+                if isinstance(doc_loaded, dict):
+                    self.synonym_map.update(doc_loaded)
+            logger.info(
+                f"loaded synonyms from Neo4j -> global={len(global_loaded) if isinstance(global_loaded, dict) else 0}, "
+                f"doc={len(doc_loaded) if isinstance(doc_loaded, dict) else 0}, total_cache={len(self.synonym_map)}"
+            )
         except Exception:
             logger.exception("failed loading synonyms from Neo4j")
 
@@ -169,7 +186,7 @@ class Extractor:
         """Estrae entità da un testo usando l'LLM."""
         raw_entities_str = self._call_llm(self.entity_extraction_prompt, text=text)
         
-        # Inizializza il dizionario delle entità con le chiavi dei tipi selezionati
+        #Inizializza il dizionario delle entità con le chiavi dei tipi selezionati
         entities = {ent_type: [] for ent_type in self.selected_entity_types}
 
         lines = raw_entities_str.split('\n')
@@ -178,7 +195,7 @@ class Extractor:
             if not line:
                 continue
             
-            # Cerca una corrispondenza con i tipi di entità definite
+            #cerca una corrispondenza con i tipi di entità definite
             for ent_type in self.selected_entity_types:
                 prefix = f"- {ent_type}:"
                 if line.startswith(prefix):
@@ -194,7 +211,7 @@ class Extractor:
 
     def _dynamic_synonym_update(self, new_topic: str, context_text: str = None):
         """
-        Induce canonical+sinonimi via LLM e persiste in Neo4j; aggiorna la mappa locale.
+         aggiorna la mappa locale.
         """
         try:
             context = (context_text or "")[:2000]
@@ -223,17 +240,15 @@ class Extractor:
             if not canonical:
                 return None
 
-            # rimuovi sinonimi identici alla forma canonica
             syns = [s for s in syns if s and s != canonical]
 
-            # persisti su Neo4j se disponibile
             if self.graph_db and syns:
                 try:
                     self.graph_db.add_synonyms(canonical, syns)
                 except Exception:
                     logger.exception("add_synonyms error")
 
-            # aggiorna mappa in memoria
+            #aggiorna mappa in memoria
             for s in syns:
                 self.synonym_map[s] = canonical
 

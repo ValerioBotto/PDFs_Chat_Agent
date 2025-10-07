@@ -5,16 +5,7 @@ import asyncio
 import uuid
 from typing import List, Any
 
-class OllamaWrapper:
-    def __init__(self, model_name: str = "llama3.2:1b", timeout: int = 90):
-        # Using a lightweight model by default
-        self.model = model_name
-        self.timeout = timeout
-        self._bound_tools = None
-        logger.info(f"OllamaWrapper initialized with model={model_name}, timeout={timeout}s")
-
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
-from langchain_core.messages import ToolMessage
 from langchain_together import ChatTogether
 
 from backend.pdf_utils.loader import get_layout_extractor
@@ -28,7 +19,6 @@ from backend.pdf_utils.agent.agent import (
     initialize_agent_tools_resources,
     invoke_agent,
 )
-# langgraph in-memory checkpointer for tutorial-style memory
 from langgraph.checkpoint.memory import InMemorySaver
 
 from backend.pdf_utils.graph_db import GraphDB
@@ -99,7 +89,6 @@ class OllamaWrapper:
 
     def invoke(self, messages: List[BaseMessage]):
         prompt = self._messages_to_prompt(messages)
-        # if tools are bound, prepend a tools description and an instruction to output JSON for tool calls
         tool_instructions = ""
         if self._bound_tools:
             descr_lines = [
@@ -115,7 +104,6 @@ Otherwise, output a normal textual answer without that JSON line.''',
 
         full_prompt = tool_instructions + prompt
 
-        # use ollama run with positional prompt argument to avoid unsupported flags
         import subprocess, json, re
         args = ["ollama", "run", self.model, full_prompt]
         try:
@@ -129,14 +117,14 @@ Otherwise, output a normal textual answer without that JSON line.''',
                 timeout=self.timeout,
             )
             text = proc.stdout.strip()
-            # try to parse a JSON object with tool_calls
+            #parse oggetti JSON con tool_calls
             tool_calls = None
             try:
                 # Search for JSON content first
                 json_markers = [
-                    (r"```(?:json)?\s*(\{[\s\S]*?\"tool_calls\"[\s\S]*?\})\s*```", re.IGNORECASE),  # code fence
-                    (r"(\{[\s\S]*?\"tool_calls\"[\s\S]*?\})", 0),  # raw JSON
-                    (r"(?:Tool call required|Using tool|Call tool):[\s\n]*(\{[\s\S]*?\"tool_calls\"[\s\S]*?\})", re.IGNORECASE),  # with prefix
+                    (r"```(?:json)?\s*(\{[\s\S]*?\"tool_calls\"[\s\S]*?\})\s*```", re.IGNORECASE),  
+                    (r"(\{[\s\S]*?\"tool_calls\"[\s\S]*?\})", 0),  
+                    (r"(?:Tool call required|Using tool|Call tool):[\s\n]*(\{[\s\S]*?\"tool_calls\"[\s\S]*?\})", re.IGNORECASE),  
                 ]
                 
                 for pattern, flags in json_markers:
@@ -147,24 +135,23 @@ Otherwise, output a normal textual answer without that JSON line.''',
                             parsed = json.loads(json_part)
                             if 'tool_calls' in parsed:
                                 tool_calls = parsed['tool_calls']
-                                if tool_calls:  # if non-empty list
+                                if tool_calls:  
                                     break
                         except json.JSONDecodeError:
                             continue
             except Exception:
                 tool_calls = None
 
-            # heuristic: if model mentions neo4j_vector_search in plain text, convert to a tool_call
+            # euristica: se il modello menziona neo4j_vector_search nel testo normale, converti in un tool_call
             if not tool_calls:
                 try:
                     lower = text.lower()
                     if "neo4j_vector_search" in lower or "vector_search" in lower:
-                        # try to extract a quoted query
+                        # prova a estrarre una query tra virgolette
                         qmatch = re.search(r"neo4j_vector_search\s*\(\s*['\"]([^'\"]+)['\"]", text, re.IGNORECASE)
                         if not qmatch:
                             qmatch = re.search(r"query\s*[:=]\s*['\"]([^'\"]+)['\"]", text, re.IGNORECASE)
                         if not qmatch:
-                            # fallback: use last line or whole prompt as query
                             last_line = text.strip().splitlines()[-1]
                             q = last_line.strip()[:200]
                         else:
@@ -187,7 +174,6 @@ Otherwise, output a normal textual answer without that JSON line.''',
             stderr = e.stderr or e.output or ""
             raise RuntimeError(f"ollama invoke failed: {stderr}")
         except subprocess.TimeoutExpired as e:
-            # primo timeout: proviamo un retry con timeout raddoppiato (fino a 120s)
             logger.warning(f"ollama invoke timed out after {self.timeout}s; retrying with longer timeout.")
             try:
                 proc = subprocess.run(
@@ -213,7 +199,6 @@ Otherwise, output a normal textual answer without that JSON line.''',
                 raise RuntimeError("ollama invoke timeout")
 
     def bind_tools(self, tools: List[Any]):
-        # store tools metadata so invoke can include descriptions
         self._bound_tools = tools
         return self
 
@@ -231,67 +216,15 @@ def get_or_create_event_loop():
 
 
 #fallback: embedding della domanda, ricerca vettoriale su neo4j e chiamata diretta all'llm
-def direct_vector_qa(user_question: str, indexer_instance: Indexer, llm_agent: ChatTogether, top_k: int = 5) -> str:
+def get_or_create_event_loop():
     try:
-        #1) genera embedding della domanda
-        query_embedding = indexer_instance.generate_embeddings(user_question)
-
-        #2) ricerca su neo4j
-        graph_db = GraphDB()
-        # If an uploaded filename is present in session, scope the search to avoid cross-document leakage
-        try:
-            active_filename = getattr(st.session_state, "uploaded_filename", None)
-        except Exception:
-            active_filename = None
-        try:
-            results = graph_db.query_vector_index("chunk_embeddings_index", query_embedding, k=top_k, filename=active_filename)
-        except TypeError:
-            results = graph_db.query_vector_index("chunk_embeddings_index", query_embedding, k=top_k)
-
-        if not results:
-            graph_db.close()
-            return "Nessun chunk rilevante trovato nel documento tramite ricerca vettoriale."
-
-        #log diagnostico
-        logger.info(f"direct_vector_qa: retrieved {len(results)} results from Neo4j.")
-        for i, r in enumerate(results, start=1):
-            logger.debug(f"result #{i}: keys={list(r.keys())}")
-            if "score" in r:
-                logger.debug(f" result #{i} score: {r.get('score')}")
-
-        #3) prepara estratti
-        excerpts = []
-        for i, r in enumerate(results, start=1):
-            content = r.get("node_content", "").strip()
-            excerpt = content if len(content) <= 1000 else content[:1000] + " ...[troncato]"
-            excerpts.append(f"[{i}] {excerpt}")
-
-        joined_context = "\n\n".join(excerpts)
-
-        #prompt strutturato
-        system_msg = (
-            "Sei un Assistente alla consultazione di PDF. Rispondi alla domanda dell'utente in modo chiaro e conciso utilizzando il contenuto degli estratti. "
-            "Nella tua risposta cita gli estratti utilizzati con il relativo numero tra parentesi quadre. "
-            "Se l'informazione non è presente nei chunk, rispondi che non è disponibile e non inventare."
-        )
-
-        prompt = f"{system_msg}\n\nContesto (estratti dal documento):\n{joined_context}\n\nDomanda: {user_question}"
-
-        #4) chiama l'llm direttamente
-        messages = [HumanMessage(content=prompt)]
-        response = llm_agent.invoke(messages)
-        resp_text = getattr(response, "content", None) or str(response)
-
-        graph_db.close()
-        return resp_text
-
-    except Exception as e:
-        logger.exception(f"direct_vector_qa fallback error: {e}")
-        try:
-            graph_db.close()
-        except Exception:
-            pass
-        return f"Errore durante ricerca diretta: {str(e)}"
+        return asyncio.get_event_loop()
+    except RuntimeError as ex:
+        if "There is no current event loop in thread" in str(ex):
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            return loop
+        raise
 
 
 #funzione per inizializzare l'agente e mcp in un contesto asincrono
@@ -353,7 +286,7 @@ async def setup_agent_and_mcp(uploaded_file_data, llm_agent, indexer_instance, e
 
         indexer_instance.index_chunks_to_neo4j(st.session_state.uploaded_filename, chunks)
 
-        # collega l'Extractor al grafo e carica sinonimi dinamici
+        #collega l'Extractor al grafo e carica sinonimi dinamici
         try:
             extractor_instance.attach_graph(graph_db, st.session_state.uploaded_filename)
         except Exception:
@@ -440,11 +373,9 @@ async def setup_agent_and_mcp(uploaded_file_data, llm_agent, indexer_instance, e
         st.error(f"errore durante l'elaborazione o indicizzazione del pdf: {str(e)}")
         logger.exception("errore critico nel processo di upload/indicizzazione del pdf.", exc_info=True)
 
-        #pulizia robusta in caso di errore
         st.session_state.pdf_uploaded = False
         st.session_state.agent_app = None
 
-        #chiusura context manager asincroni
         if st.session_state.mcp_session_context:
             try:
                 await st.session_state.mcp_session_context.__aexit__(None, None, None)
@@ -454,7 +385,7 @@ async def setup_agent_and_mcp(uploaded_file_data, llm_agent, indexer_instance, e
 
         if st.session_state.mcp_client_context:
             try:
-                await st.session_state.mcp_client_context.__aenter__(None, None, None)
+                await st.session_state.mcp_client_context.__aexit__(None, None, None)
             except Exception as e_close:
                 logger.warning(f"Errore durante la chiusura di mcp_client_context: {e_close}")
             st.session_state.mcp_client = None
@@ -493,14 +424,12 @@ with st.sidebar:
                 except Exception as e:
                     st.error(f"errore leggendo checkpoint da InMemorySaver: {e}")
 
-                # also attempt to fetch graph's state snapshot if supported
                 try:
                     cfg = {"configurable": {"thread_id": thread}}
                     snapshot = None
                     try:
                         snapshot = st.session_state.agent_app.get_state(cfg)
                     except Exception:
-                        # some compiled apps expose get_state without requiring cfg
                         try:
                             snapshot = st.session_state.agent_app.get_state()
                         except Exception:
@@ -508,7 +437,6 @@ with st.sidebar:
                     if snapshot is None:
                         st.info("agent_app.get_state non disponibile o non ha restituito snapshot.")
                     else:
-                        # display a compact view
                         try:
                             st.write({
                                 "values_keys": list(snapshot.values.keys()) if hasattr(snapshot, 'values') and isinstance(snapshot.values, dict) else str(type(snapshot))
@@ -519,10 +447,9 @@ with st.sidebar:
                 except Exception as e:
                     st.error(f"errore ottenendo snapshot da agent_app: {e}")
     except Exception:
-        # do not block normal flow if debug widget fails
         pass
 
-    # gestione del caricamento del file e setup dell'agente
+    #gestione del caricamento del file e setup dell'agente
     if uploaded_file:
         if not st.session_state.pdf_uploaded or (
             st.session_state.uploaded_filename != uploaded_file.name
@@ -543,7 +470,7 @@ with st.sidebar:
             if success:
                 st.rerun()
 
-    # bottone per pulire chat e resettare pdf
+    #bottone per pulire chat e resettare pdf
     if st.session_state.pdf_uploaded:
         if st.button("🗑️ pulisci chat e resetta pdf"):
             st.session_state.chat_history = []
@@ -596,10 +523,8 @@ if st.session_state.pdf_uploaded and st.session_state.agent_app:
                     try:
                         # Use the persistent session thread id so the compiled graph's
                         # InMemorySaver can restore prior conversation state and memory.
-                        # This enables multi-turn memory as in the LangGraph tutorial.
                         session_thread = st.session_state.get("thread_id")
                         if not session_thread:
-                            # fallback: ensure a thread id exists
                             session_thread = f"session-{uuid.uuid4().hex[:8]}"
                             st.session_state.thread_id = session_thread
 
@@ -607,7 +532,6 @@ if st.session_state.pdf_uploaded and st.session_state.agent_app:
                         cfg = {"configurable": {"thread_id": session_thread}}
 
                         # pass the current chat_history directly; let LangGraph + InMemorySaver
-                        # restore and manage conversation state per the official tutorial
                         response_content = loop.run_until_complete(
                             asyncio.wait_for(
                                 invoke_agent(
@@ -619,7 +543,6 @@ if st.session_state.pdf_uploaded and st.session_state.agent_app:
                     except asyncio.TimeoutError:
                         logger.warning("invoke_agent timed out.")
                         response_content = "Errore: l'agente ha impiegato troppo tempo per rispondere. Riprova più tardi."
-                    # original behavior: no checkpoint recovery, let invoke_agent results surface
 
                     logger.debug(f"invoke_agent returned: {response_content}")
                     if not response_content:

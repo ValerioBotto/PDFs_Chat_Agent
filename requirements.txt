@@ -12,7 +12,7 @@ neo4j
 langchain-together
 langgraph
 pydot
-graphviz
 mcp
 langchain-mcp-adapters
 
+#Necessario Ollama e llama3.2:1b

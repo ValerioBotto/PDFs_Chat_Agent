@@ -49,7 +49,7 @@ def split_sections_into_chunks(
             continue
 
         try:
-            # divide il testo della sezione in chunk
+            #divide il testo della sezione in chunk
             chunks_for_section = text_splitter.create_documents([section_text])
             
             #aggiunge metadati a ciascun chunk per indicare la sezione di origine
