@@ -330,8 +330,8 @@ async def setup_agent_and_mcp(uploaded_file_data, llm_agent, indexer_instance, e
         loaded_mcp_tools = await load_mcp_tools(st.session_state.mcp_session)
         logger.info(f"tool MCP caricati: {[t.name for t in loaded_mcp_tools]}")
 
-        # esponi anche il tool di scrittura se disponibile (nome più comune: write_neo4j_cypher)
-        allowed_mcp_names = {"read_neo4j_cypher", "get_neo4j_schema", "write_neo4j_cypher", "neo4j_write_cypher"}
+        # esponi gli strumenti utili; escludi 'get_neo4j_schema' di default per evitare timeouts
+        allowed_mcp_names = {"read_neo4j_cypher", "write_neo4j_cypher", "neo4j_write_cypher"}
         filtered_mcp_tools = [t for t in loaded_mcp_tools if t.name in allowed_mcp_names]
 
         # costruisci agente langgraph con planner locale (Ollama) per planning e Together per la synth finale

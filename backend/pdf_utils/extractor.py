@@ -82,7 +82,7 @@ class Extractor:
                 """
                 Dato un termine di topic e un estratto del documento, proponi una normalizzazione:
                 - canonical: forma canonica breve (lemma/base) del termine in italiano quando possibile
-                - synonyms: lista di sinonimi/varianti e traduzioni rilevanti (IT/EN), includendo il termine originale
+                - synonyms: al massimo 4 sinonimi/varianti e traduzioni rilevanti (IT/EN), includendo il termine originale
                 Rispondi SOLO con un oggetto JSON valido, senza backtick e senza testo extra:
                 {{"canonical": "...", "synonyms": ["...", "..."]}}
 
@@ -240,7 +240,17 @@ class Extractor:
             if not canonical:
                 return None
 
-            syns = [s for s in syns if s and s != canonical]
+            # dedup, rimuovi canonical e limita a massimo 4
+            seen = set()
+            filtered = []
+            for s in syns:
+                if not s or s == canonical:
+                    continue
+                if s in seen:
+                    continue
+                seen.add(s)
+                filtered.append(s)
+            syns = filtered[:4]
 
             if self.graph_db and syns:
                 try:

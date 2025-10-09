@@ -152,11 +152,11 @@ class GraphDB:
         crea un nodo Topic e lo collega a un Documento (se filename fornito).
         """
         query = """
-        MERGE (t:Topic {name: $topic_name})
+        MERGE (t:Topic {name: toLower($topic_name)})
         ON CREATE SET t.created_at = datetime()
         ON MATCH SET t.last_updated = datetime()
         """
-        params = {"topic_name": topic_name}
+        params = {"topic_name": (topic_name or "").strip()}
 
         if filename:
             query += """
@@ -337,3 +337,33 @@ class GraphDB:
         except Exception as e:
             logger.error(f"errore durante la query dell'indice vettoriale '{index_name}': {e}", exc_info=True)
             raise    
+
+    def log_question_answer(self, user_id: str, filename: str, question_text: str, answer_id: str, answer_text: str):
+        """
+        Registra una domanda dell'utente e la risposta dell'agente collegandole al documento corrente.
+        - Crea/Merge User e Document
+        - Merge della Question per (text, filename) per evitare duplicati per documento
+        - Crea sempre un nuovo Answer con id univoco e collega (Question)-[:HAS_ANSWER]->(Answer)
+        """
+        if not question_text or not filename:
+            return None
+        query = """
+        MERGE (u:User {id: $user_id})
+        MERGE (d:Document {filename: $filename})
+        MERGE (q:Question {text: $question_text, filename: $filename})
+        ON CREATE SET q.created_at = datetime()
+        ON MATCH SET q.last_updated = datetime()
+        MERGE (u)-[:ASKED]->(q)
+        MERGE (q)-[:IS_RELATED_TO]->(d)
+        CREATE (a:Answer {id: $answer_id, text: $answer_text, created_at: datetime()})
+        MERGE (q)-[:HAS_ANSWER]->(a)
+        RETURN q, a
+        """
+        params = {
+            "user_id": user_id or "default_user",
+            "filename": filename,
+            "question_text": question_text,
+            "answer_id": answer_id,
+            "answer_text": answer_text,
+        }
+        return self.run_query(query, params)

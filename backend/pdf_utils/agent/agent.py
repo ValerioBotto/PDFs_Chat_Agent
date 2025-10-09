@@ -248,11 +248,29 @@ def neo4j_vector_search(query: str, k: int = DEFAULT_K) -> str:
     logger.info(f"neo4j_vector_search: searching for: {query} (k={k}) filename_scope={_global_active_filename}")
     try:
         emb = _global_indexer.generate_embeddings(query)
-        #se abbiamo un documento attivo, limitiamo la ricerca a quel file
+        # Migliora il recall per documento: aumenta k e fallback a ricerca non filtrata poi filtrata
+        target_file = _global_active_filename
+        base_k = max(1, int(k) if isinstance(k, (int, float, str)) else DEFAULT_K)
+        results = []
+        # 1) Prova scoped con k aumentato per includere candidati del documento specifico
         try:
-            results = _global_graph_db.query_vector_index("chunk_embeddings_index", emb, k=k, filename=_global_active_filename)
+            if target_file:
+                results = _global_graph_db.query_vector_index(
+                    "chunk_embeddings_index", emb, k=max(base_k * 4, 25), filename=target_file
+                )
         except TypeError:
-            results = _global_graph_db.query_vector_index("chunk_embeddings_index", emb, k=k)
+            # driver firmato diversamente: esegui unscoped e filtra
+            pass
+
+        # 2) Se ancora vuoto, fallback: unscoped, poi filtra per filename
+        if not results:
+            try:
+                unscoped = _global_graph_db.query_vector_index("chunk_embeddings_index", emb, k=max(base_k * 6, 50))
+            except Exception:
+                unscoped = []
+            filtered = [r for r in (unscoped or []) if not target_file or str(r.get("filename", "")) == target_file]
+            results = (filtered or unscoped or [])[:max(base_k, DEFAULT_K)]
+
         if not results:
             return "no_results"
         parts = []
@@ -388,7 +406,8 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
         prompt_parts = []
         prompt_parts.append("You are a planner that decides which tools to call. OUTPUT ONLY ONE JSON OBJECT.\n")
         prompt_parts.append("Schema & logging policy:\n")
-        prompt_parts.append("- First, if unsure about labels/relationships/properties, call get_neo4j_schema.\n")
+        # Evita chiamate lente e inutili a get_neo4j_schema: chiamalo solo se strettamente necessario
+        prompt_parts.append("- Only if you are UNSURE about schema names, call get_neo4j_schema (otherwise skip it to save time).\n")
         prompt_parts.append("- Then CHECK whether the current user already asked this exact question for this document using read_neo4j_cypher.\n")
         prompt_parts.append("  Use parameters: {user_id, question, filename}.\n")
         prompt_parts.append("  Example read (adjust labels/properties to the actual schema):\n")
@@ -403,7 +422,7 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
         prompt_parts.append("Rules:\n")
         prompt_parts.append("- The ONLY output must be: {\"tool_calls\": [...]}\n")
         prompt_parts.append("- Each tool call: {\"name\": \"<tool_name>\", \"args\": { ... }}\n")
-        prompt_parts.append("- Prefer calling in this order when logging: get_neo4j_schema (optional) -> read_neo4j_cypher -> write_neo4j_cypher (only if missing).\n")
+        prompt_parts.append("- Prefer calling in this order when logging: (optional) get_neo4j_schema -> read_neo4j_cypher -> write_neo4j_cypher (only if missing).\n")
         prompt_parts.append(f"- Scope to the active document: filename == '{active_filename_hint}'. Use user_id='{user_id_hint}' and question set to the exact user question.\n")
         prompt_parts.append("- For read/write tools, use args keys: {\"cypher\": \"...\" , \"parameters\": {\"user_id\": \"...\", \"question\": \"...\", \"filename\": \"...\"}}\n")
         prompt_parts.append("- Also consider using neo4j_vector_search when you need semantic context.\n\n")
@@ -760,6 +779,19 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
         MAX_HISTORY = 40
         context = chat[-MAX_HISTORY:]
         #prompt per il sintetizzatore in inglese
+        # Inserisci gli ultimi estratti dei chunk (presearch) come contesto strutturato
+        presearch_chunks = ""
+        try:
+            for item in reversed(chat):
+                if isinstance(item, ToolMessage) and isinstance(getattr(item, 'content',''), str) and item.content.startswith("__PRESEARCH__"):
+                    try:
+                        presearch_chunks = item.content.split("\n", 1)[1]
+                    except Exception:
+                        presearch_chunks = item.content
+                    break
+        except Exception:
+            presearch_chunks = ""
+
         system = (
             "You are a helpful assistant specialized in answering questions about a document given a conversation history and retrieved document chunks. "
             "MOST IMPORTANT: Always prioritize and directly answer ONLY the CURRENT user's question with a fresh, concise, and contextually accurate answer. "
@@ -778,6 +810,7 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
             "Avoid hallucinating: only include information explicitly present in the chunks or previously stated by the user. "
             "If the user asks for summaries or step-by-step guidance, provide them in a structured but concise way. "
             "Keep responses self-contained, so they make sense without needing to reread previous messages, but remain consistent with prior context. "
+            "\n\nRetrieved chunks (use these as ground truth; cite chunk ids):\n" + (presearch_chunks[:4000] if isinstance(presearch_chunks, str) else "") + "\n"
         )
         # assicura che la domanda attuale dell'utente sia inclusa esplicitamente come ultimo HumanMessage
         try:
@@ -822,6 +855,22 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
             _save_checkpoint(ck)
         except Exception:
             logger.exception("checkpoint save failed")
+
+        # persisti Q/A su Neo4j se disponibile
+        try:
+            if _global_graph_db is not None:
+                q_text = state.get("question") or ""
+                if q_text.strip() and isinstance(final, str) and final.strip():
+                    ans_id = f"ans-{uuid.uuid4().hex[:12]}"
+                    _global_graph_db.log_question_answer(
+                        user_id=_global_user_id or "default_user",
+                        filename=_global_active_filename or "unknown",
+                        question_text=q_text.strip(),
+                        answer_id=ans_id,
+                        answer_text=final[:4000],
+                    )
+        except Exception:
+            logger.exception("node_synth: failed to log question/answer to Neo4j")
 
         # go to end by returning chat_history with final ai message
         # include a final_content marker to ensure callers can detect final answer regardless of stream shape
