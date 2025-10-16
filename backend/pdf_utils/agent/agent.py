@@ -116,6 +116,7 @@ _global_indexer: Optional[Indexer] = None
 _global_active_filename: Optional[str] = None
 _global_user_id: Optional[str] = None
 _firewall_llm: Optional[ChatTogether] = None
+_inflight_mcp_writes: Dict[str, float] = {}
 
 def initialize_agent_tools_resources(graph_db: GraphDB, indexer: Indexer, active_filename: Optional[str] = None, user_id: Optional[str] = None):
     global _global_graph_db, _global_indexer, _global_active_filename, _global_user_id
@@ -125,6 +126,101 @@ def initialize_agent_tools_resources(graph_db: GraphDB, indexer: Indexer, active
     _global_user_id = user_id
     logger.debug(f"agent tools resources initialized (active_filename={active_filename})")
 
+
+# --- MCP helpers (MCP-only, no direct DB fallback) ---
+def _select_mcp_tool(tools: List[Any], candidate_names: List[str]):
+    """Return the first MCP tool whose name matches exactly one of candidate_names
+    or endswith('-'+candidate) to support namespaced tools (e.g., 'local-write_neo4j_cypher').
+    """
+    try:
+        cand_l = [c for c in (candidate_names or []) if isinstance(c, str) and c]
+        for t in tools or []:
+            name = getattr(t, "name", None)
+            if not isinstance(name, str):
+                continue
+            for c in cand_l:
+                if name == c or name.endswith(f"-{c}"):
+                    return t
+    except Exception:
+        logger.exception("_select_mcp_tool failed while scanning tools")
+    return None
+
+
+async def _mcp_write_with_retry(tools: List[Any], cypher: str, params: Dict[str, Any],
+                                candidate_names: Optional[List[str]] = None,
+                                timeouts: Optional[List[float]] = None) -> None:
+    """Invoke MCP write tool with retries and increasing timeouts.
+
+    - candidate_names: ordered names to try (default: ['write_neo4j_cypher','neo4j_write_cypher'])
+    - timeouts: per-attempt timeouts in seconds (default: [env MCP_WRITE_TIMEOUT or 25, then 60])
+    Raises the last exception on failure; does not perform non-MCP fallbacks.
+    """
+    if not candidate_names:
+        candidate_names = ["write_neo4j_cypher", "neo4j_write_cypher"]
+    if not timeouts:
+        try:
+            # allow comma-separated list for granular control
+            ts_env = os.getenv("MCP_WRITE_TIMEOUTS", "")
+            if ts_env.strip():
+                parsed = []
+                for p in ts_env.split(","):
+                    try:
+                        v = float(p.strip())
+                        if v > 0:
+                            parsed.append(v)
+                    except Exception:
+                        continue
+                timeouts = parsed or None
+        except Exception:
+            timeouts = None
+        if not timeouts:
+            base = float(os.getenv("MCP_WRITE_TIMEOUT", "25"))
+            timeouts = [base, max(base * 2, 45.0)]
+
+    payload = {"query": cypher, "params": params or {}}
+    # Log payload size for debugging stdio backpressure issues
+    try:
+        import json
+        payload_json = json.dumps(payload, ensure_ascii=False)
+        payload_size = len(payload_json.encode('utf-8'))
+        logger.info(f"MCP write payload size: {payload_size} bytes (query_len={len(cypher)}, params_keys={list(params.keys()) if params else []})")
+    except Exception:
+        logger.warning("Could not calculate MCP write payload size")
+    
+    last_err = None
+    for attempt, to_sec in enumerate(timeouts, start=1):
+        tool = _select_mcp_tool(tools, candidate_names)
+        if tool is None:
+            raise RuntimeError("MCP write tool not found in available tools (check namespace or server initialization)")
+        try:
+            logger.info(f"MCP write attempt {attempt}/{len(timeouts)}; tool={getattr(tool,'name',None)} timeout={to_sec}s")
+            # MCP tools from langchain_mcp_adapters are async-only; use ainvoke
+            if hasattr(tool, "ainvoke"):
+                result = await asyncio.wait_for(tool.ainvoke(payload), timeout=to_sec)
+                logger.info(f"MCP write completed successfully; result={str(result)[:200]}")
+                return
+            else:
+                raise RuntimeError(f"MCP tool {getattr(tool,'name',None)} has no ainvoke method")
+        except asyncio.TimeoutError as e:
+            last_err = e
+            logger.warning(f"MCP write timed out on attempt {attempt}/{len(timeouts)}; will retry if attempts remain")
+        except NotImplementedError as e:
+            # StructuredTool does not support sync; should not happen since we use ainvoke
+            last_err = e
+            logger.error(f"MCP tool does not support invocation: {e}")
+            break
+        except Exception as e:
+            last_err = e
+            logger.exception(f"MCP write failed on attempt {attempt}/{len(timeouts)}; will retry if attempts remain")
+        # backoff between attempts to reduce stdio pressure
+        if attempt < len(timeouts):
+            try:
+                await asyncio.sleep(1.0)
+            except Exception:
+                pass
+    # if here, all attempts failed
+    if last_err:
+        raise last_err
 
 def _get_firewall_llm() -> Optional[ChatTogether]:
     global _firewall_llm
@@ -424,7 +520,7 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
         prompt_parts.append("- Each tool call: {\"name\": \"<tool_name>\", \"args\": { ... }}\n")
         prompt_parts.append("- Prefer calling in this order when logging: (optional) get_neo4j_schema -> read_neo4j_cypher -> write_neo4j_cypher (only if missing).\n")
         prompt_parts.append(f"- Scope to the active document: filename == '{active_filename_hint}'. Use user_id='{user_id_hint}' and question set to the exact user question.\n")
-        prompt_parts.append("- For read/write tools, use args keys: {\"cypher\": \"...\" , \"parameters\": {\"user_id\": \"...\", \"question\": \"...\", \"filename\": \"...\"}}\n")
+        prompt_parts.append("- For read/write tools, use args keys: {\"query\": \"...\" , \"params\": {\"user_id\": \"...\", \"question\": \"...\", \"filename\": \"...\"}}\n")
         prompt_parts.append("- Also consider using neo4j_vector_search when you need semantic context.\n\n")
         prompt_parts.append(f"Available tools (case-sensitive): {allowed_tools_list}\n\n")
         prompt_parts.append("Context from presearch (vector excerpts):\n")
@@ -435,8 +531,8 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
         prompt_parts.append("Examples of valid outputs (do not include prose):\n")
         prompt_parts.append("{\"tool_calls\": []}\n")
         prompt_parts.append("{\"tool_calls\": [{\"name\": \"get_neo4j_schema\", \"args\": {}}]}\n")
-        prompt_parts.append(f"{{\"tool_calls\": [{{\"name\": \"read_neo4j_cypher\", \"args\": {{\"cypher\": \"MATCH ... RETURN q LIMIT 1\", \"parameters\": {{\"user_id\": \"{user_id_hint}\", \"question\": \"{q.replace('\n',' ')}\", \"filename\": \"{active_filename_hint}\"}}}}}}]}}\n")
-        prompt_parts.append(f"{{\"tool_calls\": [{{\"name\": \"write_neo4j_cypher\", \"args\": {{\"cypher\": \"MERGE ...\", \"parameters\": {{\"user_id\": \"{user_id_hint}\", \"question\": \"{q.replace('\n',' ')}\", \"filename\": \"{active_filename_hint}\"}}}}}}]}}\n")
+        prompt_parts.append(f"{{\"tool_calls\": [{{\"name\": \"read_neo4j_cypher\", \"args\": {{\"query\": \"MATCH ... RETURN q LIMIT 1\", \"params\": {{\"user_id\": \"{user_id_hint}\", \"question\": \"{q.replace('\\n',' ')}\", \"filename\": \"{active_filename_hint}\"}}}}}}]}}\n")
+        prompt_parts.append(f"{{\"tool_calls\": [{{\"name\": \"write_neo4j_cypher\", \"args\": {{\"query\": \"MERGE ...\", \"params\": {{\"user_id\": \"{user_id_hint}\", \"question\": \"{q.replace('\\n',' ')}\", \"filename\": \"{active_filename_hint}\"}}}}}}]}}\n")
         prompt_parts.append("If the write tool is named neo4j_write_cypher in your tool list, use that exact name instead of write_neo4j_cypher.\n\n")
         prompt_parts.append(f"user_question: {q}\n")
         prompt = "".join(prompt_parts)
@@ -771,7 +867,7 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
         }
 
     # node: sintetizzatore - produce la risposta finale
-    def node_synth(state: Dict[str, Any]) -> Dict[str, Any]:
+    async def node_synth(state: Dict[str, Any]) -> Dict[str, Any]:
         # raccogli gli output recenti degli strumenti e la cronologia della chat, quindi chiama synth una volta
         chat = state.get("chat_history", [])
         #mantieni solo gli ultimi N messaggi per evitare il sovraccarico di token su together
@@ -840,6 +936,7 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
 
         logger.debug("node_synth: invoking synth llm for final answer")
         try:
+            # synth can be synchronous; safe to call inside async node
             resp = synth.invoke(msgs)
             # debug: log raw synth resp
             logger.info(f"node_synth: raw synth resp type={type(resp)} repr={repr(resp)[:400]}")
@@ -856,21 +953,110 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
         except Exception:
             logger.exception("checkpoint save failed")
 
-        # persisti Q/A su Neo4j se disponibile
+        # logging Q/A via MCP write tool (MCP-only; with retries and namespace support)
         try:
-            if _global_graph_db is not None:
-                q_text = state.get("question") or ""
-                if q_text.strip() and isinstance(final, str) and final.strip():
-                    ans_id = f"ans-{uuid.uuid4().hex[:12]}"
-                    _global_graph_db.log_question_answer(
-                        user_id=_global_user_id or "default_user",
-                        filename=_global_active_filename or "unknown",
-                        question_text=q_text.strip(),
-                        answer_id=ans_id,
-                        answer_text=final[:4000],
-                    )
+            q_text = (state.get("question") or "").strip()
+            if not q_text:
+                # fallback: prendi l'ultimo HumanMessage dalla chat_history
+                try:
+                    chat = state.get("chat_history", []) or []
+                    for item in reversed(chat):
+                        if isinstance(item, HumanMessage):
+                            ct = getattr(item, "content", None)
+                            if isinstance(ct, str) and ct.strip():
+                                q_text = ct.strip()
+                                break
+                except Exception:
+                    pass
+            if q_text and isinstance(final, str) and final.strip():
+                ans_id = f"ans-{uuid.uuid4().hex[:12]}"
+                # Truncate answer AGGRESSIVELY to reduce payload pressure on stdio transport during MCP write
+                # stdio buffers are small; keep payloads minimal
+                try:
+                    max_chars = int(os.getenv("MCP_WRITE_MAX_CHARS", "500"))
+                except Exception:
+                    max_chars = 500
+                safe_answer = final[:max_chars]
+                # Simplified Cypher: reduce query complexity to minimize stdio payload size
+                cypher = (
+                    "MERGE (u:User {id: $uid}) "
+                    "MERGE (d:Document {filename: $fn}) "
+                    "MERGE (q:Question {text: $qt}) "
+                    "ON CREATE SET q.created_at = datetime() "
+                    "CREATE (a:Answer {id: $aid, text: $at, created_at: datetime()}) "
+                    "MERGE (u)-[:ASKED]->(q) "
+                    "MERGE (q)-[:IS_RELATED_TO]->(d) "
+                    "MERGE (q)-[:HAS_ANSWER]->(a)"
+                )
+                params = {
+                    "uid": _global_user_id or "default_user",
+                    "fn": _global_active_filename or "unknown",
+                    "qt": q_text[:300],  # Truncate question too to reduce payload
+                    "aid": ans_id,
+                    "at": safe_answer,
+                }
+                try:
+                    # Decide whether to run in background to avoid blocking final answer delivery
+                    # IMPORTANT: Background tasks may be orphaned if event loop closes too early
+                    # For debugging, set MCP_WRITE_ASYNC=0 to run synchronously and see actual errors
+                    run_bg = os.getenv("MCP_WRITE_ASYNC", "0") != "0"  # Default to synchronous (0) for reliability
+                    # use question+filename as a dedup key to avoid multiple writes for same Q in a loop
+                    dedup_key = f"{(_global_active_filename or 'unknown')}::{q_text.strip()}"
+                    now_ts = time.time()
+                    last_ts = _inflight_mcp_writes.get(dedup_key)
+                    # if a recent inflight write exists within 120s, skip scheduling another
+                    if last_ts and now_ts - last_ts < 120:
+                        logger.info("node_synth: MCP write already in-flight recently for this Q; skipping duplicate schedule")
+                    else:
+                        _inflight_mcp_writes[dedup_key] = now_ts
+                        logger.info(
+                            f"node_synth: logging Q/A via MCP; q_preview='{q_text[:80].replace('\n',' ')}' ans_len={len(params['at'])} bg={run_bg}"
+                        )
+                        if run_bg:
+                            # background timeouts are typically longer; support env override
+                            ts_env = os.getenv("MCP_WRITE_TIMEOUTS_BACKGROUND", "")
+                            timeouts_bg = None
+                            if ts_env.strip():
+                                try:
+                                    timeouts_bg = [float(x.strip()) for x in ts_env.split(",") if x.strip()]
+                                except Exception:
+                                    timeouts_bg = None
+                            if not timeouts_bg:
+                                timeouts_bg = [60.0, 120.0, 180.0]
+
+                            async def _bg_write():
+                                try:
+                                    logger.info("node_synth: background MCP write task started")
+                                    await _mcp_write_with_retry(tools, cypher, params, timeouts=timeouts_bg)
+                                    logger.info("node_synth: background MCP write task completed successfully")
+                                except Exception as e:
+                                    logger.exception(f"node_synth: background MCP Q/A logging failed after retries: {e}")
+                                finally:
+                                    try:
+                                        _inflight_mcp_writes.pop(dedup_key, None)
+                                    except Exception:
+                                        pass
+
+                            # Create task and store reference to prevent garbage collection
+                            task = asyncio.create_task(_bg_write())
+                            # Give task a moment to start before continuing
+                            try:
+                                await asyncio.sleep(0.05)
+                            except Exception:
+                                pass
+                        else:
+                            # Synchronous execution - blocks until complete but ensures write finishes
+                            logger.info("node_synth: executing MCP write synchronously (blocking)")
+                            try:
+                                await _mcp_write_with_retry(tools, cypher, params)
+                                logger.info("node_synth: synchronous MCP write completed")
+                            finally:
+                                _inflight_mcp_writes.pop(dedup_key, None)
+                except Exception as e:
+                    # MCP-only policy: do not fallback; surface telemetry
+                    logger.exception(f"node_synth: MCP Q/A logging scheduling failed: {e}")
         except Exception:
-            logger.exception("node_synth: failed to log question/answer to Neo4j")
+            logger.exception("node_synth: unexpected error while preparing MCP Q/A logging")
 
         # go to end by returning chat_history with final ai message
         # include a final_content marker to ensure callers can detect final answer regardless of stream shape

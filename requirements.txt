@@ -14,5 +14,6 @@ langgraph
 pydot
 mcp
 langchain-mcp-adapters
-
-#Necessario Ollama e llama3.2:1b
+fastapi
+uvicorn
+python-multipart

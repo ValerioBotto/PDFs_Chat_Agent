@@ -310,12 +310,18 @@ async def setup_agent_and_mcp(uploaded_file_data, llm_agent, indexer_instance, e
         #3) avvio mcp server e creazione agente
         neo4j_mcp_server_params = StdioServerParameters(
             command="uvx",
-            args=["mcp-neo4j-cypher@0.3.0", "--transport", "stdio"],
+            args=[f"mcp-neo4j-cypher@{os.getenv('MCP_NEO4J_VERSION','0.4.1')}", "--transport", "stdio"],
             env={
                 "NEO4J_URI": os.getenv("NEO4J_URI", "bolt://localhost:7687"),
                 "NEO4J_USERNAME": os.getenv("NEO4J_USERNAME", "neo4j"),
                 "NEO4J_PASSWORD": os.getenv("NEO4J_PASSWORD"),
                 "NEO4J_DATABASE": os.getenv("NEO4J_DATABASE", "neo4j"),
+                # Optional tuning for responsiveness
+                "NEO4J_READ_TIMEOUT": os.getenv("NEO4J_READ_TIMEOUT", "60"),
+                # Token limit applies to read responses only, harmless to include
+                "NEO4J_RESPONSE_TOKEN_LIMIT": os.getenv("NEO4J_RESPONSE_TOKEN_LIMIT", "4000"),
+                # Namespace support (if set, tool names will be prefixed)
+                "NEO4J_NAMESPACE": os.getenv("NEO4J_NAMESPACE", ""),
             },
         )
 
@@ -333,6 +339,34 @@ async def setup_agent_and_mcp(uploaded_file_data, llm_agent, indexer_instance, e
         # esponi gli strumenti utili; escludi 'get_neo4j_schema' di default per evitare timeouts
         allowed_mcp_names = {"read_neo4j_cypher", "write_neo4j_cypher", "neo4j_write_cypher"}
         filtered_mcp_tools = [t for t in loaded_mcp_tools if t.name in allowed_mcp_names]
+        # debug: log tool schemas to confirm expected argument names
+        try:
+            for t in filtered_mcp_tools:
+                schema_info = None
+                try:
+                    if hasattr(t, "args_schema") and t.args_schema is not None:
+                        # pydantic BaseModel
+                        schema_info = t.args_schema.schema() if hasattr(t.args_schema, "schema") else str(t.args_schema)
+                    elif hasattr(t, "args"):
+                        schema_info = getattr(t, "args")
+                except Exception:
+                    schema_info = None
+                logger.info(f"MCP tool ready: name={getattr(t,'name',None)} schema={schema_info}")
+        except Exception:
+            logger.exception("failed to log MCP tool schemas")
+
+        # quick MCP smoke test (read) to confirm responsiveness
+        try:
+            read_tool = next((t for t in filtered_mcp_tools if getattr(t, 'name', None) == 'read_neo4j_cypher'), None)
+            if read_tool is not None and hasattr(read_tool, 'ainvoke'):
+                logger.info("Eseguo MCP smoke test: RETURN 1 AS ok")
+                try:
+                    await asyncio.wait_for(read_tool.ainvoke({"query": "RETURN 1 AS ok", "params": {}}), timeout=5.0)
+                    logger.info("MCP smoke test OK (read)")
+                except Exception as e:
+                    logger.warning(f"MCP smoke test FAILED: {e}")
+        except Exception:
+            logger.exception("Errore durante MCP smoke test")
 
         # costruisci agente langgraph con planner locale (Ollama) per planning e Together per la synth finale
         planner = OllamaWrapper(model_name=os.getenv("OLLAMA_MODEL", "llama3.2:1b"), timeout=int(os.getenv("OLLAMA_TIMEOUT", "90")))
