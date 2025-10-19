@@ -23,9 +23,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from backend.pdf_utils.graph_db import GraphDB
 
-from mcp.client.stdio import stdio_client
-from mcp import ClientSession, StdioServerParameters
-from langchain_mcp_adapters.tools import load_mcp_tools
+ 
 
 from dotenv import load_dotenv
 
@@ -61,15 +59,7 @@ if "llm_agent" not in st.session_state:
         timeout=60,
     )
 
-#variabili mcp nello stato
-if "mcp_client" not in st.session_state:
-    st.session_state.mcp_client = None
-if "mcp_client_context" not in st.session_state:
-    st.session_state.mcp_client_context = None
-if "mcp_session" not in st.session_state:
-    st.session_state.mcp_session = None
-if "mcp_session_context" not in st.session_state:
-    st.session_state.mcp_session_context = None
+ 
 
 
 class OllamaWrapper:
@@ -227,32 +217,16 @@ def get_or_create_event_loop():
         raise
 
 
-#funzione per inizializzare l'agente e mcp in un contesto asincrono
+#funzione per inizializzare l'agente in un contesto asincrono
 async def setup_agent_and_mcp(uploaded_file_data, llm_agent, indexer_instance, extractor_instance):
     if not TOGETHER_API_KEY:
         st.error("ERRORE: TOGETHER_API_KEY non impostata nel file .env. L'agente e l'estrattore non possono funzionare.")
         return False
 
-    #assicurati che l'agente e le sessioni mcp siano null prima di ripartire
+    #assicurati che l'agente sia null prima di ripartire
     if st.session_state.agent_app is not None:
         st.session_state.agent_app = None
-
-    #chiudi eventuali context manager mcp aperti
-    if st.session_state.mcp_session_context:
-        try:
-            await st.session_state.mcp_session_context.__aexit__(None, None, None)
-        except Exception as e:
-            logger.warning(f"Errore durante la chiusura di mcp_session_context: {e}")
-        st.session_state.mcp_session_context = None
-        st.session_state.mcp_session = None
-
-    if st.session_state.mcp_client_context:
-        try:
-            await st.session_state.mcp_client_context.__aexit__(None, None, None)
-        except Exception as e:
-            logger.warning(f"Errore durante la chiusura di mcp_client_context: {e}")
-        st.session_state.mcp_client_context = None
-        st.session_state.mcp_client = None
+    
 
     #reset stato per nuovo caricamento
     st.session_state.pdf_uploaded = False
@@ -307,67 +281,6 @@ async def setup_agent_and_mcp(uploaded_file_data, llm_agent, indexer_instance, e
         graph_db.close()
         graph_db = None
 
-        #3) avvio mcp server e creazione agente
-        neo4j_mcp_server_params = StdioServerParameters(
-            command="uvx",
-            args=[f"mcp-neo4j-cypher@{os.getenv('MCP_NEO4J_VERSION','0.4.1')}", "--transport", "stdio"],
-            env={
-                "NEO4J_URI": os.getenv("NEO4J_URI", "bolt://localhost:7687"),
-                "NEO4J_USERNAME": os.getenv("NEO4J_USERNAME", "neo4j"),
-                "NEO4J_PASSWORD": os.getenv("NEO4J_PASSWORD"),
-                "NEO4J_DATABASE": os.getenv("NEO4J_DATABASE", "neo4j"),
-                # Optional tuning for responsiveness
-                "NEO4J_READ_TIMEOUT": os.getenv("NEO4J_READ_TIMEOUT", "60"),
-                # Token limit applies to read responses only, harmless to include
-                "NEO4J_RESPONSE_TOKEN_LIMIT": os.getenv("NEO4J_RESPONSE_TOKEN_LIMIT", "4000"),
-                # Namespace support (if set, tool names will be prefixed)
-                "NEO4J_NAMESPACE": os.getenv("NEO4J_NAMESPACE", ""),
-            },
-        )
-
-        st.session_state.mcp_client = stdio_client(neo4j_mcp_server_params)
-        st.session_state.mcp_client_context = await st.session_state.mcp_client.__aenter__()
-
-        read_stream, write_stream = st.session_state.mcp_client_context
-        st.session_state.mcp_session = ClientSession(read_stream, write_stream)
-        st.session_state.mcp_session_context = await st.session_state.mcp_session.__aenter__()
-
-        await st.session_state.mcp_session.initialize()
-        loaded_mcp_tools = await load_mcp_tools(st.session_state.mcp_session)
-        logger.info(f"tool MCP caricati: {[t.name for t in loaded_mcp_tools]}")
-
-        # esponi gli strumenti utili; escludi 'get_neo4j_schema' di default per evitare timeouts
-        allowed_mcp_names = {"read_neo4j_cypher", "write_neo4j_cypher", "neo4j_write_cypher"}
-        filtered_mcp_tools = [t for t in loaded_mcp_tools if t.name in allowed_mcp_names]
-        # debug: log tool schemas to confirm expected argument names
-        try:
-            for t in filtered_mcp_tools:
-                schema_info = None
-                try:
-                    if hasattr(t, "args_schema") and t.args_schema is not None:
-                        # pydantic BaseModel
-                        schema_info = t.args_schema.schema() if hasattr(t.args_schema, "schema") else str(t.args_schema)
-                    elif hasattr(t, "args"):
-                        schema_info = getattr(t, "args")
-                except Exception:
-                    schema_info = None
-                logger.info(f"MCP tool ready: name={getattr(t,'name',None)} schema={schema_info}")
-        except Exception:
-            logger.exception("failed to log MCP tool schemas")
-
-        # quick MCP smoke test (read) to confirm responsiveness
-        try:
-            read_tool = next((t for t in filtered_mcp_tools if getattr(t, 'name', None) == 'read_neo4j_cypher'), None)
-            if read_tool is not None and hasattr(read_tool, 'ainvoke'):
-                logger.info("Eseguo MCP smoke test: RETURN 1 AS ok")
-                try:
-                    await asyncio.wait_for(read_tool.ainvoke({"query": "RETURN 1 AS ok", "params": {}}), timeout=5.0)
-                    logger.info("MCP smoke test OK (read)")
-                except Exception as e:
-                    logger.warning(f"MCP smoke test FAILED: {e}")
-        except Exception:
-            logger.exception("Errore durante MCP smoke test")
-
         # costruisci agente langgraph con planner locale (Ollama) per planning e Together per la synth finale
         planner = OllamaWrapper(model_name=os.getenv("OLLAMA_MODEL", "llama3.2:1b"), timeout=int(os.getenv("OLLAMA_TIMEOUT", "90")))
         synth = st.session_state.llm_agent
@@ -385,7 +298,6 @@ async def setup_agent_and_mcp(uploaded_file_data, llm_agent, indexer_instance, e
         st.session_state.agent_app = _build_agent_workflow(
             planner_llm=planner,
             synth_llm=synth,
-            mcp_loaded_tools=filtered_mcp_tools,
             checkpointer=memory,
         )
 
@@ -410,19 +322,7 @@ async def setup_agent_and_mcp(uploaded_file_data, llm_agent, indexer_instance, e
         st.session_state.pdf_uploaded = False
         st.session_state.agent_app = None
 
-        if st.session_state.mcp_session_context:
-            try:
-                await st.session_state.mcp_session_context.__aexit__(None, None, None)
-            except Exception as e_close:
-                logger.warning(f"Errore durante la chiusura di mcp_session_context: {e_close}")
-            st.session_state.mcp_session = None
-
-        if st.session_state.mcp_client_context:
-            try:
-                await st.session_state.mcp_client_context.__aexit__(None, None, None)
-            except Exception as e_close:
-                logger.warning(f"Errore durante la chiusura di mcp_client_context: {e_close}")
-            st.session_state.mcp_client = None
+        
 
         initialize_agent_tools_resources(None, None)
         return False
@@ -489,7 +389,7 @@ with st.sidebar:
             st.session_state.uploaded_filename != uploaded_file.name
             if hasattr(st.session_state, "uploaded_filename")
             else True
-        ) or st.session_state.mcp_client is None or st.session_state.mcp_session is None:
+        ):
 
             with st.spinner("preparazione ambiente e agente..."):
                 loop = get_or_create_event_loop()
@@ -516,17 +416,6 @@ with st.sidebar:
                 del st.session_state.processed_sections
             if hasattr(st.session_state, "processed_chunks"):
                 del st.session_state.processed_chunks
-
-            #chiudi le sessioni mcp
-            if st.session_state.mcp_session_context:
-                asyncio.run(st.session_state.mcp_session_context.__aexit__(None, None, None))
-                st.session_state.mcp_session_context = None
-                st.session_state.mcp_session = None
-
-            if st.session_state.mcp_client_context:
-                asyncio.run(st.session_state.mcp_client_context.__aexit__(None, None, None))
-                st.session_state.mcp_client_context = None
-                st.session_state.mcp_client = None
 
             initialize_agent_tools_resources(None, None)
             st.info("chat e stato pdf resettati.")

@@ -160,7 +160,6 @@ async def upload_pdf(file: UploadFile = File(...)):
 		agent_app = _build_agent_workflow(
 			planner_llm=planner,
 			synth_llm=synth,
-			mcp_loaded_tools=None,
 			checkpointer=memory,
 		)
 

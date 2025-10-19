@@ -12,8 +12,6 @@ neo4j
 langchain-together
 langgraph
 pydot
-mcp
-langchain-mcp-adapters
 fastapi
 uvicorn
 python-multipart

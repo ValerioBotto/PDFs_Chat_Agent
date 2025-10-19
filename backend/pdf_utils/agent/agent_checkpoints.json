@@ -1,70 +1,5 @@
 [
   {
-    "question": "ciao mi chiamo valerio. mi spieghi a cosa serve questo dispositivo?",
-    "answer": "Ciao Valerio, purtroppo non ho informazioni adeguate per rispondere a questa domanda in base ai chunk disponibili. Se potresti fornirmi ulteriori dettagli o contesto sul dispositivo in questione, cercherò di aiutarti nel miglior modo possibile.",
-    "ts": 1759490810
-  },
-  {
-    "question": "ciao mi chiamo valerio. mi spieghi a cosa serve il dispositivo?",
-    "answer": "Ciao Valerio, il dispositivo sembra essere un controllo elettronico con diverse funzionalità, tra cui la programmazione di operazioni (chunk:programmazione_1) e la possibilità di configurare fino a 40 programmi personalizzati (da PROG-01 a PROG-40). Inoltre, il dispositivo ha una modalità permanente, manuale e di programmazione sequenziale (chunk:programma impulso, con un on di 5 secondi che inizia alle 11:30 per tutta la settimana_0). Tuttavia, non sono state trovate informazioni specifiche sul suo utilizzo principale. Valerio, potresti fornire più contesto o dettagli su cosa ti aspetti di fare con il dispositivo?",
-    "ts": 1759491128
-  },
-  {
-    "question": "si possono impostare periodi vacanza?",
-    "answer": "Sì, Valerio, secondo il chunk (chunk:programmazione dei periodi di vacanza:_0), è possibile impostare periodi di vacanza. Per farlo, devi confermare l'ultimo giorno della settimana con il tasto OK e tenere premuto il tasto per selezionare l'operazione come periodo di vacanza. Sulla schermata verrà visualizzata la parola VACANZE e potrai selezionare uno dei 4 periodi festivi con i tasti ▼ e ▲.",
-    "ts": 1759491163
-  },
-  {
-    "question": "ti ricordi come mi chiamo?",
-    "answer": "Sì, ti ricordo! Ti chiami Valerio. Ci siamo presentati all'inizio della nostra conversazione. Come posso aiutarti adesso, Valerio?",
-    "ts": 1759491175
-  },
-  {
-    "question": "Ciao! mi chiamo valerio. Mi sapresti dire che cos'è il dispositivo di cui si parla nel pdf?",
-    "answer": "Ciao Valerio! Purtroppo, non ci sono informazioni specifiche nel testo fornito che menzionino direttamente un dispositivo. Tuttavia, il testo sembra concentrarsi su argomenti relativi all'intelligenza artificiale (IA), ai foundation models, e all'elaborazione del linguaggio umano. Se stai cercando informazioni su un dispositivo specifico, potresti voler fornire più contesto o dettagli su cosa cerchi esattamente? (chunk:1.1.1 definizioni e obiettivi dell'ia_7) e (chunk:1.2.1 l'architettura transformer_8) potrebbero essere rilevanti per comprendere meglio il tema dell'IA, ma non forniscono informazioni dirette su un dispositivo.",
-    "ts": 1759584351
-  },
-  {
-    "question": "OK! Allora potresti dirmi esattamente come vengono descritti i transformer in questo pdf?",
-    "answer": "Ciao Valerio! I transformer vengono descritti nel pdf come un'architettura innovativa che ha rivoluzionato il modo in cui i modelli di linguaggio elaborano le informazioni. (chunk:1.2.1 l'architettura transformer_3) e (1.2.2 il meccanismo di self-attention_10) spiegano che l'architettura Transformer si basa su un meccanismo di auto-attenzione che consente di trattare le sequenze di token come una rappresentazione contestuale ricca e dinamica.\n\nInoltre, (chunk:1.2.3 impatto nel nlp e oltre_7) e (chunk:1.3 large language models e foundation models_3) descrivono come i transformer abbiano aperto la possibilità di superare la tradizionale separazione tra forme di dati eterogenee, consentendo una comprensione più ampia e integrata delle informazioni. I transformer vengono anche menzionati come la base strutturale per i Large Language Models (LLM) e per i foundation models, che trovano applicazione in moltissimi scenari quotidiani, come ad esempio il supporto agli acquisti con assistenti intelligenti o la possibilità di porre domande direttamente nelle chat di WhatsApp.\n\nIn generale, i transformer vengono descritti come un'architettura potente e flessibile che ha ampliato le capacità dei modelli di linguaggio e ha aperto nuove possibilità per l'elaborazione delle informazioni. (chunk:1.2 la rivoluzione dei transformers_0) sottolinea che l'ideazione dei transformer è stata un punto cruciale nell'evoluzione dell'IA, e che ha rappresentato un cambio di paradigma nel modo in cui i modelli di linguaggio elaborano le informazioni.",
-    "ts": 1759584398
-  },
-  {
-    "question": "grazie!",
-    "answer": "Prego Valerio! Spero di aver potuto aiutarti a comprendere meglio il contenuto del pdf. Se hai altre domande o hai bisogno di ulteriore aiuto, non esitare a chiedere!",
-    "ts": 1759584416
-  },
-  {
-    "question": "Ti ricordi come mi chiamo?",
-    "answer": "Certo, Valerio! Ti ricordo che ti chiami Valerio. Abbiamo iniziato la nostra conversazione con una tua presentazione, e da allora ho sempre cercato di rivolgermi a te con il tuo nome. Spero di non aver dimenticato nulla!",
-    "ts": 1759584433
-  },
-  {
-    "question": "Di cosa si parla in questo pdf?",
-    "answer": "Il pdf sembra trattare argomenti relativi all'intelligenza artificiale (IA), come ad esempio i modelli di apprendimento automatico, l'architettura dei sistemi di IA e la programmazione di sistemi intelligenti. Sono presenti anche sezioni che discutono la definizione e gli obiettivi dell'IA, nonché la sua relazione con la percezione e l'azione nell'ambiente dell'agente. Inoltre, ci sono riferimenti a funzionalità di programmazione dei periodi di vacanza e gestione dei dispositivi. (chunk:1.1.1 definizioni e obiettivi dell'ia_1, chunk:programmazione dei periodi di vacanza:_0)",
-    "ts": 1759585033
-  },
-  {
-    "question": "Di cosa parla questo documento?",
-    "answer": "Il documento sembra trattare diversi argomenti, tra cui l'intelligenza artificiale (IA), l'apprendimento automatico, e la programmazione. Viene menzionato il ciclo di percezione-azione e l'ambiente dell'agente (chunk:2.1.1), nonché la conoscenza parziale e la necessità di mantenere uno stato interno o un modello del mondo (chunk:2.1.1). Inoltre, viene citato il sito web www.orbisitalia.it per ulteriori informazioni (chunk:pila:_5). Tuttavia, non è possibile fornire una risposta più dettagliata senza ulteriori informazioni sul contesto e sul contenuto del documento.",
-    "ts": 1759585184
-  },
-  {
-    "question": "di cosa parla questo documento?",
-    "answer": "Purtroppo, non ho abbastanza informazioni per rispondere in modo dettagliato alla tua domanda. Non ho accesso al contenuto del documento in questione. Potresti fornirmi maggiori dettagli o chiarire a quale documento ti riferisci? Così potrò darti una risposta più precisa (chunk: nessuno).",
-    "ts": 1759586413
-  },
-  {
-    "question": "di cosa parla questo documento?",
-    "answer": "Mi dispiace, ma non posso fornire una risposta più specifica in quanto il contenuto dei chunk (chunk:1 e chunk:4) sembra essere relativo a procedure e regolamenti universitari, come ad esempio la scelta del relatore per la laurea e il calcolo del punteggio finale. Non ci sono informazioni più dettagliate sui contenuti del documento. (chunk:1, chunk:4)",
-    "ts": 1759586624
-  },
-  {
-    "question": "Quindi il documento parla di come si richiede la tesi in ambito universitario?",
-    "answer": "Sì, il documento parla di come si richiede la tesi in ambito universitario. In particolare, descrive le procedure per la scelta del relatore o della relatrice, la presentazione della domanda di tesi, la preparazione e la redazione della tesi e dell'elaborato finale. (chunk:1. scelta relatore o relatrice_5, chunk:1. scelta relatore o relatrice_1) \n\nInoltre, il documento fornisce informazioni dettagliate su come effettuare le diverse operazioni, come ad esempio la compilazione del modulo di assegnazione tesi o elaborato finale e la presentazione della domanda di laurea online. (chunk:1. scelta relatore o relatrice_3, chunk:1. scelta relatore o relatrice_7) \n\nIl documento sembra essere rivolto agli studenti e alle studentesse che stanno per concludere il loro percorso di studio e che devono presentare la loro tesi per ottenere la laurea. (chunk:1. scelta relatore o relatrice_0)",
-    "ts": 1759586670
-  },
-  {
     "question": "di cosa parla il documento?",
     "answer": "Il documento parla dell'ontologia del Sistema Solare, una raccolta di conoscenze su questo dominio che potrebbe risultare utile per la ricerca, poiché non esiste già un'ontologia completa e accessibile pubblicamente (chunk:introduzione_1). Il progetto si basa su fonti specifiche, come ad esempio un documento di Google Drive (chunk:fonti_0). L'ontologia descritta è parziale, ma descrive bene alcuni aspetti del Sistema Solare e può essere espansa con ulteriori dettagli (chunk:conclusioni_1).",
     "ts": 1759587489
@@ -248,5 +183,70 @@
     "question": "quali sono le scadenze per laurearsi a novembre?",
     "answer": "Per laurearsi a novembre, è necessario aver sostenuto tutti gli esami previsti nel piano di studi entro 1 mese dalla data della laurea e aver pagato la tassa di iscrizione, secondo le indicazioni presenti sul sito del dipartimento (chunk:introduzione_0).",
     "ts": 1760618562
+  },
+  {
+    "question": "Di cosa parla il documento",
+    "answer": "Il documento parla della procedura per laurearsi nel mese di novembre, elencando i requisiti come sostenere tutti gli esami previsti e pagare la tassa di iscrizione (chunk:introduzione_0).",
+    "ts": 1760705953
+  },
+  {
+    "question": "Di cosa parla il documento",
+    "answer": "Il documento parla della procedura per laurearsi nel mese di novembre, indicando i requisiti necessari, come aver sostenuto tutti gli esami previsti nel piano di studi e aver pagato la tassa di iscrizione (chunk:introduzione_0).",
+    "ts": 1760707666
+  },
+  {
+    "question": "di cosa parla il documento?",
+    "answer": "Il documento parla della procedura per laurearsi nel mese di novembre, inclusi i requisiti che i laureandi devono soddisfare, come sostenere tutti gli esami previsti e pagare la tassa di iscrizione (chunk:introduzione_0).",
+    "ts": 1760708419
+  },
+  {
+    "question": "di cosa parla il documento?",
+    "answer": "Il documento parla della procedura per laurearsi nel mese di novembre, indicando i requisiti necessari, come aver sostenuto tutti gli esami previsti e pagato la tassa di iscrizione (chunk:introduzione_0).",
+    "ts": 1760708684
+  },
+  {
+    "question": "di cosa parla il documento?",
+    "answer": "Il documento parla della procedura per laurearsi nel mese di novembre, specificando che i laureandi devono aver superato tutti gli esami previsti e pagato la tassa di iscrizione (chunk:introduzione_0).",
+    "ts": 1760710343
+  },
+  {
+    "question": "di cosa parla il documento",
+    "answer": "Il documento parla della procedura per laurearsi nel mese di novembre, inclusi i requisiti come superare tutti gli esami previsti e pagare la tassa di iscrizione (chunk:introduzione_0).",
+    "ts": 1760711305
+  },
+  {
+    "question": "Cos'è l'architettura coala?",
+    "answer": "L'architettura CoALA (Cognitive Architectures for Language Agents) è un framework concettuale progettato per caratterizzare e progettare agenti linguistici di scopo generale. Si basa su tre dimensioni chiave: lo stoccaggio delle informazioni (memoria lavorativa e memoria a lungo termine), lo spazio di azione (azioni interne ed esterne) e il processo decisionale (strutturato come un ciclo interattivo di pianificazione ed esecuzione) (chunk:1 introduction_9).",
+    "ts": 1760712279
+  },
+  {
+    "question": "ha dei vantaggi?",
+    "answer": "Sì, l'architettura CoALA ha diversi vantaggi. In particolare, consente di organizzare e caratterizzare agenti linguistici in modo più efficiente e modulare, facilitando la progettazione e lo sviluppo di agenti più avanzati (chunk:1 introduction_9). Inoltre, CoALA fornisce una base teorica per comprendere e migliorare le prestazioni degli agenti linguistici, e consente di identificare direzioni promettenti per future ricerche e sviluppi (chunk:abstract_2).",
+    "ts": 1760712402
+  },
+  {
+    "question": "quali sono le date importanti per laurearsi a novembre?",
+    "answer": "Le date importanti per laurearsi a novembre sono: \n- 25 settembre 2025 per la compilazione della domanda online,\n- Dal 26 settembre al 27 ottobre 2025 per la consegna di frontespizio, abstract e dichiarazione informata,\n- Dal 3 all'11 novembre 2025 per la compilazione del questionario online,\n- 13 novembre 2025 per l'ultimo esame e il caricamento della tesi/elaborato finale,\n- 15 novembre 2025 per la validazione online del pdf della tesi/elaborato finale (chunk: avviso per i/le laureandi/e scadenze lauree per appello ordinario sessione di novembre 2025_1)",
+    "ts": 1760886228
+  },
+  {
+    "question": "Questo documento indica le scadenze per le lauree di novembre? mi serve saperle",
+    "answer": "Il documento originale (chunk:introduzione_0) fa riferimento al sito del dipartimento per la procedura di laurea a novembre, e specifica due requisiti: \n- aver sostenuto tutti gli esami previsti nel piano di studi entro 1 mese dalla laurea, \n- aver pagato la tassa di iscrizione (chunk:introduzione_0).",
+    "ts": 1760889655
+  },
+  {
+    "question": "quali sono le scadenze per novembre?",
+    "answer": "Le scadenze per le lauree di novembre sono specificate come segue:\n- 13 novembre 2025:ultimo esame e caricamento della tesi/elaborato finale in pdf/A (Portale Studente).\n- 15 novembre 2025: validazione on line del pdf della tesi/elaborato finale (scadenza solo per i/le Docenti Relatori/Relatrici).\n- 25 settembre 2025: compilazione domanda on line (Portale Studente).\n- Dal 26 settembre al 27 ottobre 2025: consegna frontespizio, abstract e dichiarazione informata (consegna obbligatoria tramite email).\n- Dal 3 al 10 novembre 2025: compilazione questionario on line (Disum)",
+    "ts": 1760889756
+  },
+  {
+    "question": "quali sono le scadenze per novembre?",
+    "answer": "I laureandi e le laureande devono aver sostenuto tutti gli esami previsti nel piano di studi entro 1 mese dalla laurea, e devono aver pagato la tassa di iscrizione (chunk:introduzione_0). Tuttavia, le scadenze esatte non sono specificate nel testo fornito. È consigliabile controllare il sito del dipartimento per maggiori informazioni sulle procedure di laurea nel mese di novembre.",
+    "ts": 1760890534
+  },
+  {
+    "question": "elenca le scadenze per novembre",
+    "answer": "Le scadenze per novembre sono:\n\n- 25 settembre 2025: Compilazione domanda on line (Portale Studente)\n- Dal 26 settembre al 27 ottobre 2025: Consegna frontespizio, abstract e dichiarazione informata (consegnati tramite email all'indirizzo lauree.disum@gmail.com)\n- Dal 3 al 10 novembre 2025: Compilazione questionario on line (Disum)\n- 13 novembre 2025: Ultimo esame e caricamento della tesi/elaborato finale in pdf/A (Portale Studente)\n- 15 novembre 2025: Validazione on line del pdf della tesi/elaborato finale (scadenza solo per i docenti relatori) (chunk: avviso per i/le laureandi/e scadenze lauree per appello ordinario sessione di novembre 2025_1)",
+    "ts": 1760890964
   }
 ]

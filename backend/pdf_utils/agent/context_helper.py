@@ -1,411 +1,358 @@
 """
-Cross-document context helper utilities (MCP-only).
-
-Goal: when the active document doesn't provide enough context, discover
-and fetch relevant chunks from other documents in Neo4j (same or related topics),
-using MCP tools to execute Cypher queries. No direct GraphDB client usage here.
-
-This module is intentionally lightweight and decoupled from the agent graph.
-It exposes pure helpers that can be called from agent nodes or tools.
-
-Key functions:
-- decide_insufficient: heuristics to decide whether primary search is insufficient.
-- get_active_topics_via_mcp: fetch topics for the active document via MCP.
-- find_related_docs_via_mcp: discover related documents using MCP read-cypher.
-- retrieve_chunks_for_docs: vector search per candidate document, using MCP.
-- build_augmented_context: merge/format primary and cross-doc results.
-- crossdoc_augmented_search: orchestration end-to-end.
-
-Notes:
-- MCP tools are required. If missing, helpers return empty results instead of falling back.
-- We avoid importing from agent.py to prevent circular imports.
+Context Helper per ricerca cross-document intelligente.
+Permette all'agente di cercare informazioni in documenti correlati quando il documento corrente non contiene abbastanza informazioni.
 """
-
-from __future__ import annotations
-
-import asyncio
-import json
 import logging
-from typing import Any, Dict, List, Optional, Sequence, Tuple
-
-from backend.pdf_utils.indexer import Indexer
+from typing import List, Dict, Any
 
 logger = logging.getLogger(__name__)
 
 
-# ------------------------------
-# Heuristics: insufficient context
-# ------------------------------
-
-def decide_insufficient(
-    primary_results: Optional[Sequence[Dict[str, Any]]],
-    *,
-    min_results: int = 3,
-    min_avg_score: float = 0.20,
-    allow_if_contains_answer_like: bool = True,
-) -> Tuple[bool, str]:
+class ContextHelper:
     """
-    Decide if the initial vector-search results from the active document are insufficient.
-
-    Inputs:
-    - primary_results: list of dicts as returned by your vector search layer
-      [{'node_content', 'score', 'chunk_id', 'section', 'filename'}, ...]
-
-    Returns: (insufficient: bool, reason: str)
+    Helper per arricchire il contesto dell'agente con informazioni da documenti correlati.
+    Usa una strategia ibrida: topic matching + vector similarity search.
     """
-    try:
-        if not primary_results:
-            return True, "no_results_from_active_document"
-        n = len(primary_results)
-        if n < min_results:
-            return True, f"too_few_results({n}<{min_results})"
-        # safety for missing scores
-        scores = [float(r.get("score", 0.0)) for r in primary_results if isinstance(r, dict)]
-        if not scores:
-            return True, "no_scores_in_results"
-        avg_score = sum(scores) / len(scores)
-        if avg_score < min_avg_score:
-            return True, f"low_avg_score({avg_score:.3f}<{min_avg_score})"
-
-        if allow_if_contains_answer_like:
-            # quick textual heuristic: presence of explicit answer-like sentences
-            text_blob = "\n".join(str(r.get("node_content", "")) for r in primary_results if isinstance(r, dict))
-            lowered = text_blob.lower()
-            # If content looks like it includes definitions/explanations, consider it sufficient
-            hints = ("in conclusione", "in summary", "definizione", "definition", "conclude")
-            if any(h in lowered for h in hints):
-                return False, "answer_like_content_present"
-        return False, "sufficient_context"
-    except Exception as e:
-        logger.warning(f"decide_insufficient failed, defaulting to cross-doc: {e}")
-        return True, "heuristic_error"
-
-
-# ------------------------------
-# MCP helpers
-# ------------------------------
-
-def _select_mcp_tool(tools: Optional[List[Any]], candidate_names: List[str]) -> Optional[Any]:
-    """Pick the first MCP tool whose .name matches one of candidate_names or endswith('-<candidate>')."""
-    if not tools:
-        return None
-    names = set(candidate_names)
-    try:
-        for t in tools:
-            try:
-                n = getattr(t, "name", None) or getattr(t, "__name__", None)
-            except Exception:
-                n = None
-            if not n:
-                continue
-            if n in names:
-                return t
-            # support namespaced like "local-read_neo4j_cypher"
-            for cand in candidate_names:
-                if n.endswith("-" + cand) or n.endswith("_" + cand):
-                    return t
-    except Exception as e:
-        logger.debug(f"_select_mcp_tool error: {e}")
-    return None
-
-
-async def _mcp_read_cypher(
-    tools: Optional[List[Any]],
-    cypher: str,
-    params: Optional[Dict[str, Any]] = None,
-    *,
-    timeout: Optional[float] = None,
-    candidate_names: Optional[List[str]] = None,
-) -> Optional[List[Dict[str, Any]]]:
-    """
-    Invoke MCP read-cypher tool and parse result into list[dict]. Returns None on failure.
-    Expected tool input: {"query": <cypher>, "params": <dict>}.
-    """
-    candidate_names = candidate_names or ["read_neo4j_cypher", "neo4j_read_cypher"]
-    tool = _select_mcp_tool(tools, candidate_names)
-    if not tool:
-        return None
-
-    payload = {"query": cypher, "params": params or {}}
-    try:
-        # Try async path first
-        if hasattr(tool, "ainvoke"):
-            coro = tool.ainvoke(payload)
-            if timeout and timeout > 0:
-                raw = await asyncio.wait_for(coro, timeout=timeout)
-            else:
-                raw = await coro
-        else:
-            # Sync path, but avoid blocking the loop if called from async
-            def _call_sync():
-                if hasattr(tool, "invoke"):
-                    return tool.invoke(payload)
-                return None
-
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    raw = await asyncio.to_thread(_call_sync)
-                else:
-                    raw = _call_sync()
-            except RuntimeError:
-                # No running loop
-                raw = _call_sync()
-
-        # Parse: many MCP tools return list[dict], or JSON string
-        if raw is None:
-            return None
-        if isinstance(raw, list):
-            # already in structured form
-            return [dict(r) if not isinstance(r, dict) else r for r in raw]
-        if isinstance(raw, dict):
-            # sometimes tools return {"rows": [...]} or similar
-            if "rows" in raw and isinstance(raw["rows"], list):
-                return [dict(r) if not isinstance(r, dict) else r for r in raw["rows"]]
-            # fallback: single-row dict
-            return [raw]
-        if isinstance(raw, str):
-            try:
-                parsed = json.loads(raw)
-                if isinstance(parsed, list):
-                    return [dict(r) if not isinstance(r, dict) else r for r in parsed]
-                if isinstance(parsed, dict):
-                    if "rows" in parsed and isinstance(parsed["rows"], list):
-                        return [dict(r) if not isinstance(r, dict) else r for r in parsed["rows"]]
-                    return [parsed]
-            except Exception:
-                # last resort: not JSON
-                logger.debug("_mcp_read_cypher: non-JSON string result; returning None")
-                return None
-        # Unknown type
-        return None
-    except Exception as e:
-        logger.warning(f"_mcp_read_cypher failed: {e}")
-        return None
-
-
-# ------------------------------
-# Related document discovery (MCP-only)
-# ------------------------------
-
-async def get_active_topics_via_mcp(
-    active_filename: str,
-    mcp_tools: Optional[List[Any]],
-    *,
-    timeout: Optional[float] = None,
-) -> Optional[List[str]]:
-    """Fetch topics attached to the active document via MCP; returns lowercased names."""
-    cypher = (
-        "MATCH (d:Document {filename: $filename})-[:HAS_TOPIC]->(t:Topic) "
-        "RETURN collect(distinct toLower(t.name)) AS topics"
-    )
-    rows = await _mcp_read_cypher(mcp_tools, cypher, {"filename": active_filename}, timeout=timeout)
-    if not rows:
-        return None
-    try:
-        row = rows[0]
-        topics = row.get("topics") if isinstance(row, dict) else None
-        if isinstance(topics, list):
-            return [str(x).lower() for x in topics if x]
-    except Exception:
-        pass
-    return None
-
-async def find_related_docs_via_mcp(
-    active_filename: str,
-    mcp_tools: Optional[List[Any]],
-    *,
-    limit: int = 3,
-    timeout: Optional[float] = None,
-) -> List[Tuple[str, int]]:
-    """
-    Use MCP read-cypher to find other documents that share topics with the active one.
-    Returns list of (filename, overlap_count) sorted by overlap desc.
-    """
-    # First, try overlap-based discovery
-    cypher = (
-        "MATCH (d:Document {filename: $filename})-[:HAS_TOPIC]->(t:Topic) "
-        "MATCH (other:Document)-[:HAS_TOPIC]->(t) "
-        "WHERE other.filename <> $filename "
-        "WITH other, count(DISTINCT t) AS overlap "
-        "ORDER BY overlap DESC "
-        "RETURN other.filename AS filename, overlap "
-        "LIMIT $limit"
-    )
-    rows = await _mcp_read_cypher(
-        mcp_tools,
-        cypher,
-        {"filename": active_filename, "limit": limit},
-        timeout=timeout,
-    )
-    out: List[Tuple[str, int]] = []
-    if rows:
-        try:
-            for r in rows:
-                fn = r.get("filename") if isinstance(r, dict) else None
-                ov = r.get("overlap") if isinstance(r, dict) else None
-                if fn and ov is not None:
-                    out.append((str(fn), int(ov)))
-        except Exception:
-            pass
-    return out
-
-
     
-
-
-# ------------------------------
-# Chunk retrieval per document (MCP-only)
-# ------------------------------
-
-async def retrieve_chunks_for_docs(
-    question: str,
-    candidate_filenames: Sequence[str],
-    *,
-    indexer: Indexer,
-    mcp_tools: Optional[List[Any]],
-    k_per_doc: int = 4,
-    index_name: str = "chunk_embeddings_index",
-) -> List[Dict[str, Any]]:
-    """
-    For each candidate document, run a vector search scoped to that document using MCP.
-    Uses CALL db.index.vector.queryNodes via the MCP read-cypher tool.
-    """
-    if not candidate_filenames or not mcp_tools:
-        return []
-    q_emb = indexer.generate_embeddings(question)
-    all_res: List[Dict[str, Any]] = []
-    for fn in candidate_filenames:
-        cypher = (
-            "CALL db.index.vector.queryNodes($index_name, $k, $query_embedding) "
-            "YIELD node, score "
-            "WITH node, score "
-            "MATCH (d:Document {filename: $filename})-[:HAS_CHUNK]->(node) "
-            "RETURN node.content AS node_content, score, node.chunk_id AS chunk_id, "
-            "node.section AS section, d.filename AS filename"
-        )
-        params = {
-            "index_name": index_name,
-            "k": int(k_per_doc),
-            "query_embedding": q_emb,
-            "filename": fn,
-        }
+    def __init__(self, graph_db, indexer):
+        """
+        Inizializza il ContextHelper.
+        
+        Args:
+            graph_db: Istanza di GraphDB per query Cypher
+            indexer: Istanza di Indexer per embeddings e vector search
+        """
+        self.graph_db = graph_db
+        self.indexer = indexer
+        logger.info("ContextHelper inizializzato")
+    
+    def find_documents_by_topics(self, current_filename: str, max_docs: int = 5) -> List[str]:
+        """
+        Trova documenti che condividono almeno un topic con il documento corrente.
+        
+        Args:
+            current_filename: Nome del documento corrente
+            max_docs: Numero massimo di documenti da ritornare
+            
+        Returns:
+            Lista di filename di documenti correlati (esclude il documento corrente)
+        """
         try:
-            rows = await _mcp_read_cypher(mcp_tools, cypher, params)
-            if rows:
-                for r in rows:
-                    if isinstance(r, dict):
-                        all_res.append({
-                            "node_content": r.get("node_content"),
-                            "score": float(r.get("score", 0.0)),
-                            "chunk_id": r.get("chunk_id"),
-                            "section": r.get("section"),
-                            "filename": r.get("filename"),
-                        })
+            #query: trova documenti con topic in comune
+            query = """
+            MATCH (current:Document {filename: $current_filename})-[:HAS_TOPIC]->(topic:Topic)
+            MATCH (other:Document)-[:HAS_TOPIC]->(topic)
+            WHERE other.filename <> $current_filename
+            WITH other, COUNT(DISTINCT topic) as shared_topics
+            ORDER BY shared_topics DESC
+            LIMIT $max_docs
+            RETURN other.filename as filename, shared_topics
+            """
+            
+            with self.graph_db.driver.session() as session:
+                result = session.run(query, {
+                    "current_filename": current_filename,
+                    "max_docs": max_docs
+                })
+                
+                related_docs = []
+                for record in result:
+                    filename = record.get("filename")
+                    shared_topics = record.get("shared_topics", 0)
+                    if filename:
+                        related_docs.append(filename)
+                        logger.debug(f"Documento correlato trovato: {filename} (topic condivisi: {shared_topics})")
+                
+                logger.info(f"Trovati {len(related_docs)} documenti correlati per topic a '{current_filename}'")
+                return related_docs
+                
         except Exception as e:
-            logger.warning(f"MCP vector retrieval for '{fn}' failed: {e}")
-    # sort by score desc and deduplicate by (filename, chunk_id)
-    seen: set[Tuple[str, str]] = set()
-    dedup: List[Dict[str, Any]] = []
-    for r in sorted(all_res, key=lambda x: float(x.get("score", 0.0)), reverse=True):
-        key = (str(r.get("filename")), str(r.get("chunk_id")))
-        if key in seen:
-            continue
-        seen.add(key)
-        dedup.append(r)
-    return dedup
-
-
-# ------------------------------
-# Merge/format utilities
-# ------------------------------
-
-def build_augmented_context(
-    primary_results: Optional[Sequence[Dict[str, Any]]],
-    crossdoc_results: Optional[Sequence[Dict[str, Any]]],
-    *,
-    max_total: int = 12,
-) -> Dict[str, Any]:
-    """
-    Merge primary and cross-doc results, preferring higher scores while keeping source labels.
-    Returns a dict with unified 'results' and a 'text' field ready for LLM consumption.
-    """
-    primary = list(primary_results or [])
-    cross = list(crossdoc_results or [])
-    combined = primary + cross
-    # sort by score desc, keep top N unique
-    seen: set[Tuple[str, str]] = set()
-    uniq: List[Dict[str, Any]] = []
-    for r in sorted(combined, key=lambda x: float(x.get("score", 0.0)), reverse=True):
-        key = (str(r.get("filename")), str(r.get("chunk_id")))
-        if key in seen:
-            continue
-        seen.add(key)
-        uniq.append(r)
-        if len(uniq) >= max_total:
-            break
-
-    # Build a textual context block
-    lines: List[str] = []
-    for i, r in enumerate(uniq, start=1):
-        fn = r.get("filename", "unknown")
-        sec = r.get("section", "")
-        sc = r.get("score", 0.0)
-        content = r.get("node_content", "")
-        header = f"[#{i}] file={fn} section={sec} score={sc:.3f}"
-        lines.append(header)
-        lines.append(str(content))
-        lines.append("")
-
-    return {"results": uniq, "text": "\n".join(lines).strip()}
-
-
-# ------------------------------
-# Orchestration
-# ------------------------------
-
-async def crossdoc_augmented_search(
-    question: str,
-    active_filename: str,
-    *,
-    indexer: Indexer,
-    mcp_tools: Optional[List[Any]] = None,
-    candidate_docs_limit: int = 3,
-    k_per_doc: int = 4,
-    mcp_timeout: Optional[float] = None,
-) -> Dict[str, Any]:
-    """
-    Discover related docs (via MCP) and retrieve top-k chunks per doc using MCP.
-    Returns the same structure as build_augmented_context for convenience:
-    {"results": [...], "text": "..."}.
-    """
-    if not question or not active_filename:
-        return {"results": [], "text": ""}
-
-    # Step 1: discover candidate docs (MCP required)
-    candidates: List[str] = []
-    try:
-        if mcp_tools:
-            pairs = await find_related_docs_via_mcp(active_filename, mcp_tools, limit=candidate_docs_limit, timeout=mcp_timeout)
-            candidates = [fn for fn, _ in pairs if fn]
-    except Exception as e:
-        logger.warning(f"candidate discovery failed, fallback to empty: {e}")
-        candidates = []
-
-    if not candidates:
-        return {"results": [], "text": ""}
-
-    # Step 2: retrieve chunks per candidate doc (MCP required)
-    try:
-        cross = await retrieve_chunks_for_docs(
-            question,
-            candidates,
-            indexer=indexer,
-            mcp_tools=mcp_tools,
-            k_per_doc=k_per_doc,
+            logger.exception(f"Errore nella ricerca documenti per topic: {e}")
+            return []
+    
+    def search_chunks_in_documents(
+        self, 
+        query: str, 
+        target_filenames: List[str], 
+        k: int = 5
+    ) -> List[Dict[str, Any]]:
+        """
+        Esegue vector search limitata a specifici documenti.
+        
+        Args:
+            query: Testo della domanda da cercare
+            target_filenames: Lista di filename dove cercare
+            k: Numero di chunk da ritornare per documento
+            
+        Returns:
+            Lista di chunk con metadata (filename, chunk_id, content, score)
+        """
+        if not target_filenames:
+            logger.warning("Nessun documento target specificato per la ricerca")
+            return []
+        
+        try:
+            #genera embedding della query
+            query_embedding = self.indexer.generate_embeddings(query)
+            
+            all_chunks = []
+            
+            #esegui ricerca su ogni documento target
+            for filename in target_filenames:
+                try:
+                    results = self.graph_db.query_vector_index(
+                        "chunk_embeddings_index",
+                        query_embedding,
+                        k=k,
+                        filename=filename
+                    )
+                    
+                    for result in results:
+                        chunk_data = {
+                            "filename": result.get("filename", filename),
+                            "chunk_id": result.get("chunk_id", "unknown"),
+                            "content": result.get("node_content", ""),
+                            "score": result.get("score", 0.0)
+                        }
+                        all_chunks.append(chunk_data)
+                        
+                    logger.debug(f"Trovati {len(results)} chunk in '{filename}'")
+                    
+                except TypeError:
+                    #fallback se query_vector_index non supporta il parametro filename
+                    logger.warning(f"Impossibile filtrare per filename '{filename}', uso ricerca globale")
+                    continue
+                except Exception as e:
+                    logger.error(f"Errore nella ricerca chunk in '{filename}': {e}")
+                    continue
+            
+            #ordina per score decrescente
+            all_chunks.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+            
+            logger.info(f"Totale chunk trovati da documenti correlati: {len(all_chunks)}")
+            return all_chunks
+            
+        except Exception as e:
+            logger.exception(f"Errore nella ricerca vettoriale cross-document: {e}")
+            return []
+    
+    def enrich_context_with_related_docs(
+        self, 
+        current_filename: str, 
+        question: str, 
+        max_external_chunks: int = 5
+    ) -> Dict[str, Any]:
+        """
+        METODO PRINCIPALE: Arricchisce il contesto con informazioni da documenti correlati.
+        Strategia ibrida:
+        1. Trova documenti con topic simili (phase 1: topic filtering)
+        2. Esegue vector search su questi documenti (phase 2: similarity search)
+        3. Ritorna i chunk più rilevanti con metadata chiare
+        
+        Args:
+            current_filename: Nome del documento corrente
+            question: Domanda dell'utente
+            max_external_chunks: Numero massimo di chunk esterni da includere
+            
+        Returns:
+            Dizionario con:
+            - related_documents: lista di filename usati
+            - external_chunks: lista di chunk trovati con metadata
+            - summary: stringa formattata per il planner
+        """
+        logger.info(f"Arricchimento contesto per documento '{current_filename}'")
+        
+        #fase 1: trova documenti correlati per topic
+        related_docs = self.find_documents_by_topics(current_filename, max_docs=5)
+        
+        if not related_docs:
+            logger.info("Nessun documento correlato trovato, ritorno contesto vuoto")
+            return {
+                "related_documents": [],
+                "external_chunks": [],
+                "summary": "Nessun documento correlato trovato nel knowledge graph."
+            }
+        
+        #fase 2: vector search sui documenti correlati
+        external_chunks = self.search_chunks_in_documents(
+            query=question,
+            target_filenames=related_docs,
+            k=max_external_chunks
         )
-    except Exception as e:
-        logger.warning(f"retrieve_chunks_for_docs failed: {e}")
-        cross = []
-
-    return {"results": cross, "text": "\n".join([str(r.get("node_content", "")) for r in cross])}
+        
+        #limita al numero richiesto
+        external_chunks = external_chunks[:max_external_chunks]
+        
+        if not external_chunks:
+            logger.info("Nessun chunk rilevante trovato nei documenti correlati")
+            return {
+                "related_documents": related_docs,
+                "external_chunks": [],
+                "summary": f"Trovati {len(related_docs)} documenti correlati ma nessun chunk rilevante."
+            }
+        
+        #formatta risultati per il planner
+        summary_parts = []
+        summary_parts.append(f"=== INFORMAZIONI DA DOCUMENTI CORRELATI ===\n")
+        summary_parts.append(f"Documenti consultati: {', '.join(related_docs)}\n")
+        summary_parts.append(f"Chunk rilevanti trovati: {len(external_chunks)}\n\n")
+        
+        for idx, chunk in enumerate(external_chunks, start=1):
+            source_doc = chunk.get("filename", "unknown")
+            chunk_id = chunk.get("chunk_id", "unknown")
+            content = chunk.get("content", "")[:500]  #limita lunghezza
+            score = chunk.get("score", 0.0)
+            
+            summary_parts.append(f"[{idx}] Fonte: {source_doc} (chunk: {chunk_id}, score: {score:.3f})\n")
+            summary_parts.append(f"    {content}\n\n")
+        
+        summary = "".join(summary_parts)
+        
+        result = {
+            "related_documents": related_docs,
+            "external_chunks": external_chunks,
+            "summary": summary
+        }
+        
+        logger.info(f"Contesto arricchito con {len(external_chunks)} chunk da {len(related_docs)} documenti")
+        return result
+    
+    def format_answer_with_sources(
+        self, 
+        answer: str, 
+        used_documents: List[str], 
+        current_filename: str
+    ) -> str:
+        """
+        Formatta la risposta finale indicando esplicitamente le fonti utilizzate.
+        
+        Args:
+            answer: Risposta generata dall'agente
+            used_documents: Lista di documenti esterni utilizzati
+            current_filename: Nome del documento corrente
+            
+        Returns:
+            Risposta formattata con indicazione delle fonti
+        """
+        if not used_documents:
+            return answer
+        
+        #aggiungi nota sulle fonti alla fine della risposta
+        sources_note = "\n\n---\n📚 **Fonti consultate:**\n"
+        sources_note += f"- Documento principale: `{current_filename}`\n"
+        
+        for doc in used_documents:
+            sources_note += f"- Documento correlato: `{doc}`\n"
+        
+        return answer + sources_note
+    
+    def log_cross_document_usage(
+        self,
+        answer_id: str,
+        external_chunks: List[Dict[str, Any]]
+    ) -> None:
+        """
+        Crea relazioni ENRICHED_BY tra Answer e documenti esterni usati.
+        Include metadata sui chunk specifici usati (chunk_ids, scores).
+        
+        Args:
+            answer_id: ID hash della risposta (Answer.id)
+            external_chunks: Lista di chunk esterni da enrich_context_with_related_docs
+        """
+        if not external_chunks:
+            logger.debug("Nessun chunk esterno da loggare")
+            return
+        
+        #raggruppa chunk per documento
+        docs_data = {}
+        for chunk in external_chunks:
+            filename = chunk.get("filename")
+            chunk_id = chunk.get("chunk_id")
+            score = chunk.get("score", 0.0)
+            
+            if not filename:
+                continue
+            
+            if filename not in docs_data:
+                docs_data[filename] = {
+                    "chunk_ids": [],
+                    "chunk_scores": []
+                }
+            
+            docs_data[filename]["chunk_ids"].append(chunk_id)
+            docs_data[filename]["chunk_scores"].append(score)
+        
+        #crea relazioni ENRICHED_BY per ogni documento esterno
+        for filename, data in docs_data.items():
+            query = """
+            MATCH (a:Answer {id: $answer_id})
+            MATCH (d:Document {filename: $filename})
+            MERGE (a)-[r:ENRICHED_BY]->(d)
+            SET r.chunk_ids = $chunk_ids,
+                r.chunk_scores = $chunk_scores,
+                r.chunk_count = $chunk_count,
+                r.used_at = timestamp()
+            """
+            
+            try:
+                with self.graph_db.driver.session() as session:
+                    session.run(query, {
+                        "answer_id": answer_id,
+                        "filename": filename,
+                        "chunk_ids": data["chunk_ids"],
+                        "chunk_scores": data["chunk_scores"],
+                        "chunk_count": len(data["chunk_ids"])
+                    })
+                logger.info(f"Creata relazione ENRICHED_BY: Answer({answer_id}) -> {filename} ({len(data['chunk_ids'])} chunks)")
+            except Exception as e:
+                logger.error(f"Errore nella creazione ENRICHED_BY per {filename}: {e}")
+    
+    def log_primary_chunks_usage(
+        self,
+        answer_id: str,
+        primary_chunks: List[Dict],
+        current_filename: str
+    ) -> None:
+        """
+        Crea relazione (Answer)-[:ENRICHED_BY]->(Document) per il documento corrente.
+        
+        Args:
+            answer_id: ID hash della risposta
+            primary_chunks: Lista di dict con chunk_id, filename, score
+            current_filename: Nome del documento corrente
+        """
+        if not primary_chunks or not current_filename:
+            logger.debug("Nessun chunk primario da loggare")
+            return
+        
+        # Estrai chunk IDs e scores
+        chunk_ids = [str(c.get("chunk_id", "?")) for c in primary_chunks]
+        chunk_scores = [float(c.get("score", 0.0)) for c in primary_chunks]
+        
+        if not chunk_ids:
+            logger.debug("Nessun chunk_id valido trovato")
+            return
+        
+        #crea relazione ENRICHED_BY per il documento corrente
+        query = """
+        MATCH (a:Answer {id: $answer_id})
+        MATCH (d:Document {filename: $filename})
+        MERGE (a)-[r:ENRICHED_BY]->(d)
+        SET r.chunk_ids = $chunk_ids,
+            r.chunk_scores = $chunk_scores,
+            r.chunk_count = $chunk_count,
+            r.used_at = timestamp()
+        """
+        
+        try:
+            with self.graph_db.driver.session() as session:
+                session.run(query, {
+                    "answer_id": answer_id,
+                    "filename": current_filename,
+                    "chunk_ids": chunk_ids,
+                    "chunk_scores": chunk_scores,
+                    "chunk_count": len(chunk_ids)
+                })
+            logger.info(f"Creata relazione ENRICHED_BY (primary): Answer({answer_id}) -> {current_filename} ({len(chunk_ids)} chunks)")
+        except Exception as e:
+            logger.error(f"Errore nella creazione ENRICHED_BY per primary document {current_filename}: {e}")

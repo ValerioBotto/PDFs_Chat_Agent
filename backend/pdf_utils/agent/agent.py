@@ -14,6 +14,7 @@ from langchain_together import ChatTogether
 
 from backend.pdf_utils.graph_db import GraphDB
 from backend.pdf_utils.indexer import Indexer
+from backend.pdf_utils.agent.context_helper import ContextHelper
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,12 @@ try:
 except Exception:
     DEFAULT_K = 8
 logger.info(f"agent: DEFAULT_K for vector search set to {DEFAULT_K}")
+
+# limite massimo di chiamate consecutive allo stesso tool prima di forzare l'uscita verso la sintesi
+try:
+    MAX_SAME_TOOL = int(os.getenv("AGENT_MAX_SAME_TOOL", "3"))
+except Exception:
+    MAX_SAME_TOOL = 3
 
 def _extract_json_object_with_key(text: str, key: str = "tool_calls") -> Optional[Dict[str, Any]]:
     """Estrae l’ultimo oggetto JSON bilanciato da un testo che contiene una certa chiave.
@@ -116,7 +123,8 @@ _global_indexer: Optional[Indexer] = None
 _global_active_filename: Optional[str] = None
 _global_user_id: Optional[str] = None
 _firewall_llm: Optional[ChatTogether] = None
-_inflight_mcp_writes: Dict[str, float] = {}
+_global_last_search_metadata: Dict[str, Any] = {}  # Track metadata from last search
+ 
 
 def initialize_agent_tools_resources(graph_db: GraphDB, indexer: Indexer, active_filename: Optional[str] = None, user_id: Optional[str] = None):
     global _global_graph_db, _global_indexer, _global_active_filename, _global_user_id
@@ -127,100 +135,6 @@ def initialize_agent_tools_resources(graph_db: GraphDB, indexer: Indexer, active
     logger.debug(f"agent tools resources initialized (active_filename={active_filename})")
 
 
-# --- MCP helpers (MCP-only, no direct DB fallback) ---
-def _select_mcp_tool(tools: List[Any], candidate_names: List[str]):
-    """Return the first MCP tool whose name matches exactly one of candidate_names
-    or endswith('-'+candidate) to support namespaced tools (e.g., 'local-write_neo4j_cypher').
-    """
-    try:
-        cand_l = [c for c in (candidate_names or []) if isinstance(c, str) and c]
-        for t in tools or []:
-            name = getattr(t, "name", None)
-            if not isinstance(name, str):
-                continue
-            for c in cand_l:
-                if name == c or name.endswith(f"-{c}"):
-                    return t
-    except Exception:
-        logger.exception("_select_mcp_tool failed while scanning tools")
-    return None
-
-
-async def _mcp_write_with_retry(tools: List[Any], cypher: str, params: Dict[str, Any],
-                                candidate_names: Optional[List[str]] = None,
-                                timeouts: Optional[List[float]] = None) -> None:
-    """Invoke MCP write tool with retries and increasing timeouts.
-
-    - candidate_names: ordered names to try (default: ['write_neo4j_cypher','neo4j_write_cypher'])
-    - timeouts: per-attempt timeouts in seconds (default: [env MCP_WRITE_TIMEOUT or 25, then 60])
-    Raises the last exception on failure; does not perform non-MCP fallbacks.
-    """
-    if not candidate_names:
-        candidate_names = ["write_neo4j_cypher", "neo4j_write_cypher"]
-    if not timeouts:
-        try:
-            # allow comma-separated list for granular control
-            ts_env = os.getenv("MCP_WRITE_TIMEOUTS", "")
-            if ts_env.strip():
-                parsed = []
-                for p in ts_env.split(","):
-                    try:
-                        v = float(p.strip())
-                        if v > 0:
-                            parsed.append(v)
-                    except Exception:
-                        continue
-                timeouts = parsed or None
-        except Exception:
-            timeouts = None
-        if not timeouts:
-            base = float(os.getenv("MCP_WRITE_TIMEOUT", "25"))
-            timeouts = [base, max(base * 2, 45.0)]
-
-    payload = {"query": cypher, "params": params or {}}
-    # Log payload size for debugging stdio backpressure issues
-    try:
-        import json
-        payload_json = json.dumps(payload, ensure_ascii=False)
-        payload_size = len(payload_json.encode('utf-8'))
-        logger.info(f"MCP write payload size: {payload_size} bytes (query_len={len(cypher)}, params_keys={list(params.keys()) if params else []})")
-    except Exception:
-        logger.warning("Could not calculate MCP write payload size")
-    
-    last_err = None
-    for attempt, to_sec in enumerate(timeouts, start=1):
-        tool = _select_mcp_tool(tools, candidate_names)
-        if tool is None:
-            raise RuntimeError("MCP write tool not found in available tools (check namespace or server initialization)")
-        try:
-            logger.info(f"MCP write attempt {attempt}/{len(timeouts)}; tool={getattr(tool,'name',None)} timeout={to_sec}s")
-            # MCP tools from langchain_mcp_adapters are async-only; use ainvoke
-            if hasattr(tool, "ainvoke"):
-                result = await asyncio.wait_for(tool.ainvoke(payload), timeout=to_sec)
-                logger.info(f"MCP write completed successfully; result={str(result)[:200]}")
-                return
-            else:
-                raise RuntimeError(f"MCP tool {getattr(tool,'name',None)} has no ainvoke method")
-        except asyncio.TimeoutError as e:
-            last_err = e
-            logger.warning(f"MCP write timed out on attempt {attempt}/{len(timeouts)}; will retry if attempts remain")
-        except NotImplementedError as e:
-            # StructuredTool does not support sync; should not happen since we use ainvoke
-            last_err = e
-            logger.error(f"MCP tool does not support invocation: {e}")
-            break
-        except Exception as e:
-            last_err = e
-            logger.exception(f"MCP write failed on attempt {attempt}/{len(timeouts)}; will retry if attempts remain")
-        # backoff between attempts to reduce stdio pressure
-        if attempt < len(timeouts):
-            try:
-                await asyncio.sleep(1.0)
-            except Exception:
-                pass
-    # if here, all attempts failed
-    if last_err:
-        raise last_err
 
 def _get_firewall_llm() -> Optional[ChatTogether]:
     global _firewall_llm
@@ -338,6 +252,7 @@ def firewall_check(query: str) -> str:
 #neo4j_vector_search tool
 @tool(description="ricerca vettoriale neo4j: esegue una ricerca vettoriale sull'indice dei chunk e restituisce estratti; limitata al documento corrente quando disponibile")
 def neo4j_vector_search(query: str, k: int = DEFAULT_K) -> str:
+    global _global_last_search_metadata
     if _global_indexer is None or _global_graph_db is None:
         logger.error("neo4j_vector_search called before resources initialized")
         return "error: resources not initialized"
@@ -368,7 +283,19 @@ def neo4j_vector_search(query: str, k: int = DEFAULT_K) -> str:
             results = (filtered or unscoped or [])[:max(base_k, DEFAULT_K)]
 
         if not results:
+            _global_last_search_metadata["primary_chunks"] = []
             return "no_results"
+        
+        # Save metadata for relationship tracking
+        primary_chunks = []
+        for r in results:
+            primary_chunks.append({
+                "chunk_id": str(r.get("chunk_id", "?")),
+                "filename": str(r.get("filename", target_file or "?")),
+                "score": float(r.get("score", 0.0))
+            })
+        _global_last_search_metadata["primary_chunks"] = primary_chunks
+        
         parts = []
         for i, r in enumerate(results, start=1):
             cid = r.get("chunk_id", "?")
@@ -381,19 +308,278 @@ def neo4j_vector_search(query: str, k: int = DEFAULT_K) -> str:
         return f"error: {e}"
 
 
+# --- cypher helpers and generic tools ---
+def _run_cypher(query: str, params: Optional[Dict[str, Any]] = None):
+    """Esegue una query Cypher usando l'istanza globale di GraphDB e ritorna il Result del driver."""
+    if _global_graph_db is None:
+        raise RuntimeError("graph not initialized")
+    fn = getattr(_global_graph_db, "run_query", None)
+    if callable(fn):
+        return fn(query, params or {})
+    # fallback ad altri nomi per compatibilità
+    for cand in ("run_cypher", "execute_cypher", "run"):
+        f = getattr(_global_graph_db, cand, None)
+        if callable(f):
+            try:
+                return f(query, params or {})
+            except TypeError:
+                return f(query)
+    raise RuntimeError("no suitable cypher execution method found on GraphDB")
+
+
+def _fetch_rows(query: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """Esegue una query e restituisce una lista di rows (dict) in modo robusto."""
+    rows: List[Dict[str, Any]] = []
+    res = None
+    try:
+        res = _run_cypher(query, params)
+        try:
+            for rec in res:
+                try:
+                    if hasattr(rec, "data"):
+                        rows.append(rec.data())
+                    else:
+                        rows.append(dict(rec))
+                except Exception:
+                    rows.append({"_": str(rec)})
+        except Exception:
+            # fallback se res non è iterabile
+            if isinstance(res, dict):
+                rows = [res]
+            elif isinstance(res, list):
+                rows = [r if isinstance(r, dict) else {"_": str(r)} for r in res]
+            elif res is not None:
+                rows = [{"_": str(res)}]
+    except Exception:
+        logger.exception("_fetch_rows failed")
+    return rows
+
+
+@tool(description="read_neo4j_cypher: esegue una query Cypher di sola lettura e restituisce i risultati in JSON")
+def read_neo4j_cypher(query: str, params: Optional[Dict[str, Any]] = None, limit: int = 50) -> str:
+    try:
+        res = _run_cypher(query, params)
+        rows: List[Dict[str, Any]] = []
+        try:
+            for rec in res:
+                try:
+                    if hasattr(rec, "data"):
+                        rows.append(rec.data())
+                    else:
+                        rows.append(dict(rec))
+                except Exception:
+                    rows.append({"_": str(rec)})
+        except Exception:
+            if isinstance(res, dict):
+                rows = [res]
+            elif isinstance(res, list):
+                rows = [r if isinstance(r, dict) else {"_": str(r)} for r in res]
+            else:
+                rows = [{"_": str(res)}]
+        try:
+            n = max(1, int(limit))
+            rows = rows[:n]
+        except Exception:
+            pass
+        return json.dumps(rows, ensure_ascii=False)
+    except Exception as e:
+        logger.exception("read_neo4j_cypher failed")
+        return f"error: {e}"
+
+
+@tool(description="write_neo4j_cypher: esegue una query Cypher di scrittura (MERGE/CREATE/SET). Ritorna 'ok' o l'errore.")
+def write_neo4j_cypher(query: str, params: Optional[Dict[str, Any]] = None) -> str:
+    try:
+        _run_cypher(query, params)
+        return "ok"
+    except Exception as e:
+        logger.exception("write_neo4j_cypher failed")
+        return f"error: {e}"
+
+
+@tool(description="log_conversation: Persist the current user question to the knowledge graph. Creates (User)-[:ASKED]->(Question)-[:IS_RELATED_TO]->(Document). Call this BEFORE attempting to answer to record that the user asked this question. This enriches the knowledge graph with conversational history.")
+def log_conversation(question: Optional[str] = None, user_id: Optional[str] = None, filename: Optional[str] = None) -> str:
+    """Logs a user question to Neo4j without the answer (answer will be added later)."""
+    try:
+        uid = (user_id or _global_user_id or "default_user")
+        qtext = (question or "").strip()
+        fname = (filename or _global_active_filename or "").strip()
+
+        if not qtext:
+            return "error: missing question"
+        if not fname:
+            return "error: missing filename"
+
+        # Check if question already exists
+        rows = _fetch_rows(
+            """
+            MATCH (u:User {id: $user_id})-[:ASKED]->(q:Question {text: $question})-[:IS_RELATED_TO]->(d:Document {filename: $filename})
+            RETURN q
+            """,
+            {"user_id": uid, "question": qtext, "filename": fname},
+        )
+        
+        if len(rows) > 0:
+            return "already_logged"
+
+        # Create new question node and relationships
+        _run_cypher(
+            """
+            MERGE (u:User {id: $user_id})
+            ON CREATE SET u.createdAt = timestamp()
+            MERGE (d:Document {filename: $filename})
+            ON CREATE SET d.createdAt = timestamp()
+            CREATE (q:Question {text: $question, createdAt: timestamp(), updatedAt: timestamp()})
+            MERGE (u)-[:ASKED]->(q)
+            MERGE (q)-[:IS_RELATED_TO]->(d)
+            SET d.lastAccessedAt = timestamp()
+            """,
+            {"user_id": uid, "question": qtext, "filename": fname},
+        )
+
+        return "logged"
+    except Exception as e:
+        logger.exception("log_conversation tool failed")
+        return f"error: {e}"
+
+
+def _log_answer_to_neo4j(
+    question: str, 
+    answer: str, 
+    user_id: Optional[str] = None, 
+    filename: Optional[str] = None,
+    external_chunks: Optional[List[Dict]] = None,
+    primary_chunks: Optional[List[Dict]] = None
+):
+    """Internal function to log the answer after synthesis (not exposed as a tool)."""
+    try:
+        uid = (user_id or _global_user_id or "default_user")
+        qtext = question.strip()
+        fname = (filename or _global_active_filename or "").strip()
+        atext = answer.strip()
+
+        if not qtext or not fname or not atext:
+            logger.warning(f"_log_answer_to_neo4j: missing data (q={bool(qtext)}, f={bool(fname)}, a={bool(atext)})")
+            return
+
+        # First ensure question exists
+        _run_cypher(
+            """
+            MERGE (u:User {id: $user_id})
+            ON CREATE SET u.createdAt = timestamp()
+            MERGE (d:Document {filename: $filename})
+            ON CREATE SET d.createdAt = timestamp()
+            MERGE (q:Question {text: $question})
+            ON CREATE SET q.createdAt = timestamp(), q.updatedAt = timestamp()
+            MERGE (u)-[:ASKED]->(q)
+            MERGE (q)-[:IS_RELATED_TO]->(d)
+            SET d.lastAccessedAt = timestamp()
+            """,
+            {"user_id": uid, "question": qtext, "filename": fname},
+        )
+
+        #Then add answer
+        import hashlib
+        ahash = hashlib.sha256(atext.encode("utf-8")).hexdigest()[:16]  # shorter hash
+        
+        _run_cypher(
+            """
+            MATCH (q:Question {text: $question})
+            MERGE (a:Answer {id: $ahash})
+            ON CREATE SET a.text = $answer, a.createdAt = timestamp(), a.updatedAt = timestamp()
+            ON MATCH SET a.text = $answer, a.updatedAt = timestamp()
+            MERGE (q)-[:HAS_ANSWER]->(a)
+            """,
+            {"question": qtext, "answer": atext, "ahash": ahash},
+        )
+        
+        logger.info(f"_log_answer_to_neo4j: answer logged successfully for question '{qtext[:50]}...'")
+        
+        # Track document usage with ENRICHED_BY relationships
+        if external_chunks or primary_chunks:
+            if _global_graph_db is None or _global_indexer is None:
+                logger.warning("Cannot track ENRICHED_BY: graph_db or indexer not initialized")
+            else:
+                from .context_helper import ContextHelper
+                context_helper = ContextHelper(_global_graph_db, _global_indexer)
+                
+                if external_chunks:
+                    logger.info(f"Tracking {len(external_chunks)} external chunks usage")
+                    context_helper.log_cross_document_usage(ahash, external_chunks)
+                
+                if primary_chunks:
+                    logger.info(f"Tracking {len(primary_chunks)} primary chunks usage")
+                    context_helper.log_primary_chunks_usage(ahash, primary_chunks, fname)
+                
+    except Exception as e:
+        logger.exception("_log_answer_to_neo4j failed")
+        raise
+
+
+@tool(description="cross_document_search: Search for relevant information across ALL documents in the knowledge graph that share topics with the current document. Use this when the current document does not contain sufficient information to fully answer the question. Returns chunks from related documents with explicit source attribution.")
+def cross_document_search(question: str, max_chunks: int = 5) -> str:
+    """
+    Cerca informazioni in documenti correlati al documento corrente.
+    Usa strategia ibrida: topic matching + vector similarity.
+    
+    Args:
+        question: Domanda dell'utente
+        max_chunks: Numero massimo di chunk da ritornare (default 5)
+        
+    Returns:
+        Stringa formattata con chunk rilevanti e fonti esplicite
+    """
+    global _global_last_search_metadata
+    if _global_graph_db is None or _global_indexer is None:
+        logger.error("cross_document_search chiamato prima dell'inizializzazione")
+        return "error: resources not initialized"
+    
+    current_file = _global_active_filename
+    if not current_file:
+        logger.warning("cross_document_search: nessun documento corrente attivo")
+        return "error: no active document"
+    
+    try:
+        #crea istanza di ContextHelper
+        context_helper = ContextHelper(_global_graph_db, _global_indexer)
+        
+        #esegui ricerca cross-document con strategia ibrida
+        logger.info(f"cross_document_search: ricerca per '{question[:50]}...' nel contesto di '{current_file}'")
+        
+        result = context_helper.enrich_context_with_related_docs(
+            current_filename=current_file,
+            question=question,
+            max_external_chunks=max_chunks
+        )
+        
+        # Save external chunks metadata for relationship tracking
+        external_chunks = result.get("external_chunks", [])
+        if external_chunks:
+            _global_last_search_metadata["external_chunks"] = external_chunks
+            logger.info(f"cross_document_search: salvati {len(external_chunks)} external chunks metadata")
+        else:
+            _global_last_search_metadata["external_chunks"] = []
+        
+        #ritorna il summary formattato
+        summary = result.get("summary", "")
+        
+        if not summary or "Nessun" in summary:
+            return "no_external_info: Il documento corrente non ha documenti correlati nel knowledge graph."
+        
+        return summary
+        
+    except Exception as e:
+        logger.exception("cross_document_search failed")
+        return f"error: {e}"
+
 
 # --- agent workflow builder ---
-def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_tools: List[Any] = None, mcp_loaded_tools: List[Any] = None, checkpointer: Any = None):
+def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, checkpointer: Any = None):
     planner = planner_llm
     synth = synth_llm or planner_llm
 
-    if mcp_loaded_tools and not mcp_tools:
-        mcp_tools = mcp_loaded_tools
-
     #definizione degli strumenti
-    tools = [neo4j_vector_search]
-    if mcp_tools:
-        tools.extend(mcp_tools)
+    tools = [neo4j_vector_search, read_neo4j_cypher, write_neo4j_cypher, log_conversation, cross_document_search]
 
     try:
         if planner is not None and hasattr(planner, "bind_tools"):
@@ -464,6 +650,10 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
         logger.debug(f"node_planner: processing question='{q}', state_keys={list(state.keys())}")
         if not q or not q.strip():
             logger.error(f"node_planner: question is empty! Full state={state}")
+        # loop guard: read last tool metadata from state
+        loop_meta = state.get("tool_loop_meta") or {}
+        last_tool = loop_meta.get("last_tool")
+        same_tool_count = int(loop_meta.get("same_tool_count", 0))
         allowed_tools_list = ", ".join([getattr(t, 'name', None) or getattr(t, '__name__', str(t)) for t in tools])
         #raccoglie l'ultimo output PRESEARCH per informare il planner
         presearch_output = ""
@@ -480,7 +670,7 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
             presearch_output = ""
         presearch_preview = presearch_output[:1200]
 
-        #raccoglie il più recente output generico di ToolMessage (es., last read_neo4j_cypher result)
+    #raccoglie il più recente output generico di ToolMessage (se presente)
         last_tool_output = ""
         try:
             chat = state.get("chat_history", []) or []
@@ -498,43 +688,41 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
         user_id_hint = _global_user_id or "default_user"
 
         #costruisce un prompt rigido: il planner DEVE emettere un singolo oggetto JSON e nient'altro
-        #provo questa definizione con liste
         prompt_parts = []
-        prompt_parts.append("You are a planner that decides which tools to call. OUTPUT ONLY ONE JSON OBJECT.\n")
-        prompt_parts.append("Schema & logging policy:\n")
-        # Evita chiamate lente e inutili a get_neo4j_schema: chiamalo solo se strettamente necessario
-        prompt_parts.append("- Only if you are UNSURE about schema names, call get_neo4j_schema (otherwise skip it to save time).\n")
-        prompt_parts.append("- Then CHECK whether the current user already asked this exact question for this document using read_neo4j_cypher.\n")
-        prompt_parts.append("  Use parameters: {user_id, question, filename}.\n")
-        prompt_parts.append("  Example read (adjust labels/properties to the actual schema):\n")
-        prompt_parts.append("  MATCH (u:User {id: $user_id})-[:ASKED]->(q:Question {text: $question})-[:IS_RELATED_TO]->(d:Document {filename: $filename}) RETURN q LIMIT 1\n")
-        prompt_parts.append("- IF NO ROWS are returned, WRITE a record linking the user and the question to the current document using write_neo4j_cypher (or neo4j_write_cypher).\n")
-        prompt_parts.append("  Example write with MERGE (adjust names to schema):\n")
-        prompt_parts.append("  MERGE (u:User {id: $user_id})\n")
-        prompt_parts.append("  MERGE (q:Question {text: $question})\n")
-        prompt_parts.append("  MERGE (d:Document {filename: $filename})\n")
-        prompt_parts.append("  MERGE (u)-[:ASKED]->(q)\n")
-        prompt_parts.append("  MERGE (q)-[:IS_RELATED_TO]->(d)\n")
+        prompt_parts.append("You are an intelligent planner that decides which tools to call. OUTPUT ONLY ONE JSON OBJECT.\n\n")
+        prompt_parts.append("Available tools:\n")
+        prompt_parts.append("1. 'log_conversation': Record this question in the knowledge graph. Call FIRST if important.\n")
+        prompt_parts.append("2. 'neo4j_vector_search': Search current document chunks. Primary tool for context.\n")
+        prompt_parts.append("3. 'cross_document_search': Search across ALL related documents (hybrid topic+similarity). Use when current document lacks sufficient info.\n")
+        prompt_parts.append("4. 'read_neo4j_cypher': Execute read-only Cypher queries on the graph.\n")
+        prompt_parts.append("5. 'write_neo4j_cypher': Execute write Cypher queries.\n\n")
+        prompt_parts.append("Strategy:\n")
+        prompt_parts.append("- Start with 'neo4j_vector_search' on current document (already done in presearch).\n")
+        prompt_parts.append("- If presearch results seem INCOMPLETE or INSUFFICIENT, call 'cross_document_search' to find info in related documents.\n")
+        prompt_parts.append("- Use 'cross_document_search' when: presearch has low scores, missing key info, or question asks about topics not well covered in current doc.\n")
+        prompt_parts.append("- When you have enough context, return empty tool_calls to generate answer.\n\n")
         prompt_parts.append("Rules:\n")
-        prompt_parts.append("- The ONLY output must be: {\"tool_calls\": [...]}\n")
+        prompt_parts.append("- Output ONLY: {\"tool_calls\": []} OR {\"tool_calls\": [{\"name\": \"tool\", \"args\": {...}}]}\n")
         prompt_parts.append("- Each tool call: {\"name\": \"<tool_name>\", \"args\": { ... }}\n")
-        prompt_parts.append("- Prefer calling in this order when logging: (optional) get_neo4j_schema -> read_neo4j_cypher -> write_neo4j_cypher (only if missing).\n")
-        prompt_parts.append(f"- Scope to the active document: filename == '{active_filename_hint}'. Use user_id='{user_id_hint}' and question set to the exact user question.\n")
-        prompt_parts.append("- For read/write tools, use args keys: {\"query\": \"...\" , \"params\": {\"user_id\": \"...\", \"question\": \"...\", \"filename\": \"...\"}}\n")
-        prompt_parts.append("- Also consider using neo4j_vector_search when you need semantic context.\n\n")
-        prompt_parts.append(f"Available tools (case-sensitive): {allowed_tools_list}\n\n")
-        prompt_parts.append("Context from presearch (vector excerpts):\n")
+        prompt_parts.append(f"- Current document: '{active_filename_hint}', user: '{user_id_hint}'\n\n")
+        prompt_parts.append("Tool arguments:\n")
+        prompt_parts.append("- log_conversation: {\"question\": \"user question\"}\n")
+        prompt_parts.append("- neo4j_vector_search: {\"query\": \"search text\", \"k\": 5}\n")
+        prompt_parts.append("- cross_document_search: {\"question\": \"user question\", \"max_chunks\": 5}\n")
+        prompt_parts.append("- read_neo4j_cypher: {\"query\": \"MATCH ... RETURN ...\"}\n")
+        prompt_parts.append("- write_neo4j_cypher: {\"query\": \"MERGE ... SET ...\"}\n\n")
+        prompt_parts.append(f"Available: {allowed_tools_list}\n\n")
+        prompt_parts.append("Context from presearch:\n")
         prompt_parts.append(presearch_preview + "\n\n")
         if last_tool_preview:
-            prompt_parts.append("Last tool output preview (if any):\n")
+            prompt_parts.append("Last tool output:\n")
             prompt_parts.append(last_tool_preview + "\n\n")
-        prompt_parts.append("Examples of valid outputs (do not include prose):\n")
+        prompt_parts.append("Examples:\n")
         prompt_parts.append("{\"tool_calls\": []}\n")
-        prompt_parts.append("{\"tool_calls\": [{\"name\": \"get_neo4j_schema\", \"args\": {}}]}\n")
-        prompt_parts.append(f"{{\"tool_calls\": [{{\"name\": \"read_neo4j_cypher\", \"args\": {{\"query\": \"MATCH ... RETURN q LIMIT 1\", \"params\": {{\"user_id\": \"{user_id_hint}\", \"question\": \"{q.replace('\\n',' ')}\", \"filename\": \"{active_filename_hint}\"}}}}}}]}}\n")
-        prompt_parts.append(f"{{\"tool_calls\": [{{\"name\": \"write_neo4j_cypher\", \"args\": {{\"query\": \"MERGE ...\", \"params\": {{\"user_id\": \"{user_id_hint}\", \"question\": \"{q.replace('\\n',' ')}\", \"filename\": \"{active_filename_hint}\"}}}}}}]}}\n")
-        prompt_parts.append("If the write tool is named neo4j_write_cypher in your tool list, use that exact name instead of write_neo4j_cypher.\n\n")
-        prompt_parts.append(f"user_question: {q}\n")
+        prompt_parts.append("{\"tool_calls\": [{\"name\": \"cross_document_search\", \"args\": {\"question\": \"user question\"}}]}\n")
+        prompt_parts.append("{\"tool_calls\": [{\"name\": \"neo4j_vector_search\", \"args\": {\"query\": \"search\", \"k\": 5}}]}\n\n")
+        prompt_parts.append(f"USER QUESTION: {q}\n\n")
+        prompt_parts.append("Analyze presearch results. If insufficient, use cross_document_search. Output JSON only.\n")
         prompt = "".join(prompt_parts)
         logger.debug("node_planner: invoking planner for decision")
         try:
@@ -547,7 +735,7 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
             text = ""
             tool_calls = None
 
-        #Debugging e fallback vario con copilot
+    #Debugging e fallback vario con copilot
         # try to parse JSON fragments if planner emitted them in text. Prefer direct tool_calls
         # attribute; otherwise, use a robust balanced-brace extractor to get the last JSON object
         # that contains "tool_calls". Fall back to whole-text json parsing.
@@ -584,6 +772,47 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
                         if isinstance(parsed_whole, dict) and "tool_calls" in parsed_whole:
                             parsed_calls = parsed_whole.get("tool_calls")
                             had_json_fragment = True
+                    except Exception:
+                        pass
+                # 4) Balanced-bracket extractor for array after "tool_calls":
+                if not parsed_calls and isinstance(text, str) and "tool_calls" in text:
+                    try:
+                        idx = text.rfind("tool_calls")
+                        # find the first '[' after idx
+                        lb = text.find('[', idx)
+                        if lb != -1:
+                            depth = 0
+                            in_str = False
+                            esc = False
+                            end = -1
+                            for j in range(lb, len(text)):
+                                ch = text[j]
+                                if in_str:
+                                    if esc:
+                                        esc = False
+                                    elif ch == '\\':
+                                        esc = True
+                                    elif ch == '"':
+                                        in_str = False
+                                else:
+                                    if ch == '"':
+                                        in_str = True
+                                    elif ch == '[':
+                                        depth += 1
+                                    elif ch == ']':
+                                        depth -= 1
+                                        if depth == 0:
+                                            end = j
+                                            break
+                            if end != -1:
+                                arr_txt = text[lb:end+1]
+                                try:
+                                    arr = json.loads(arr_txt)
+                                    if isinstance(arr, list):
+                                        parsed_calls = arr
+                                        had_json_fragment = True
+                                except Exception:
+                                    pass
                     except Exception:
                         pass
 
@@ -656,15 +885,27 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
             had_json_fragment = locals().get('had_json_fragment') or ('{' in (text or '') and '}' in (text or ''))
 
             if is_json_like or had_json_fragment:
-                # planner returned only JSON or contained a JSON fragment — do not append raw
-                # planner JSON/text to user chat. Proceed to synth using context.
-                logger.info("node_planner: planner returned JSON-only or contained JSON fragment; proceeding to synth without exposing raw planner text")
-                return {
-                    "chat_history": state.get("chat_history", []), 
-                    "question": q,
-                    "intermediate_steps": state.get("intermediate_steps", []),
-                    "synth": True
-                }
+                # If the text looks like JSON or contained a fragment, try one more time to extract tool_calls
+                # from the full text itself. If found, proceed with tool execution; otherwise synth.
+                try:
+                    # Prefer robust extractor, then fallback to whole-text JSON
+                    obj2 = _extract_json_object_with_key(text or "", "tool_calls")
+                    if isinstance(obj2, dict) and "tool_calls" in obj2 and isinstance(obj2["tool_calls"], list):
+                        parsed_calls = obj2["tool_calls"]
+                    elif text_stripped.startswith("{"):
+                        parsed_whole2 = json.loads(text_stripped)
+                        if isinstance(parsed_whole2, dict) and isinstance(parsed_whole2.get("tool_calls"), list):
+                            parsed_calls = parsed_whole2.get("tool_calls")
+                except Exception:
+                    parsed_calls = None
+                if not parsed_calls:
+                    logger.info("node_planner: JSON-only/fragment but no usable tool_calls found; proceeding to synth")
+                    return {
+                        "chat_history": state.get("chat_history", []), 
+                        "question": q,
+                        "intermediate_steps": state.get("intermediate_steps", []),
+                        "synth": True
+                    }
 
             # otherwise store planner textual rationale as AIMessage and signal synth
             am = AIMessage(content=text)
@@ -730,6 +971,10 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
             current_question = q or state.get("question", "")
             logger.info(f"node_planner: no valid tool_calls after filtering; forcing neo4j_vector_search intermediate step for current question: '{current_question[:100]}'")
             try:
+                # avoid forcing another vector search if we are already looping on vector_search
+                if last_tool == "neo4j_vector_search" and same_tool_count >= MAX_SAME_TOOL:
+                    logger.warning("node_planner: skipping forced vector_search due to loop guard; proceeding to synth")
+                    return {"chat_history": state.get("chat_history", []), "synth": True}
                 forced_tid = f"tc-forced-{uuid.uuid4().hex[:8]}"
                 forced_step = {"name": "neo4j_vector_search", "args": {"query": current_question, "k": DEFAULT_K}, "id": forced_tid}
                 return {"chat_history": state.get("chat_history", []), "intermediate_steps": [forced_step]}
@@ -737,10 +982,22 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
                 logger.exception("node_planner: failed to create forced intermediate step; falling back to synth")
                 return {"chat_history": state.get("chat_history", []), "synth": True}
 
+        # apply loop guard: if planner keeps requesting the same tool consecutively, cap it and move to synth
+        next_tool = (filtered[-1].get("name") or "").strip()
+        if next_tool == last_tool:
+            same_tool_count += 1
+        else:
+            same_tool_count = 1
+        new_loop_meta = {"last_tool": next_tool, "same_tool_count": same_tool_count}
+        if next_tool.lower() == "neo4j_vector_search" and same_tool_count > MAX_SAME_TOOL:
+            logger.warning(f"node_planner: detected {same_tool_count} consecutive '{next_tool}' calls; switching to synth to avoid recursion")
+            return {"chat_history": state.get("chat_history", []), "question": q, "tool_loop_meta": new_loop_meta, "synth": True}
+
         return {
             "chat_history": state.get("chat_history", []), 
             "question": q,
-            "intermediate_steps": filtered
+            "intermediate_steps": filtered,
+            "tool_loop_meta": new_loop_meta,
         }
 
     #nodo: call tool esegue la chiamata allo strumento specificato
@@ -770,8 +1027,22 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
                         args["k"] = args_k_int
                     except Exception:
                         args["k"] = DEFAULT_K
+            # auto-fill per log_conversation
+            if isinstance(name, str) and "log_conversation" in name.lower() and isinstance(args, dict):
+                if not args.get("user_id"):
+                    args["user_id"] = _global_user_id or "default_user"
+                if not args.get("filename"):
+                    args["filename"] = _global_active_filename or ""
+                if not args.get("question"):
+                    args["question"] = state.get("question", "")
+            # auto-fill per cross_document_search
+            if isinstance(name, str) and "cross_document_search" in name.lower() and isinstance(args, dict):
+                if not args.get("question"):
+                    args["question"] = state.get("question", "")
+                if not args.get("max_chunks"):
+                    args["max_chunks"] = 5
         except Exception:
-            logger.exception("node_call_tool: error sanitizing args for vector search")
+            logger.exception("node_call_tool: error sanitizing args")
 
         # se lo strumento è neo4j_vector_search, cerca sempre utilizzando la
         # domanda attuale dello stato. Questo impedisce che gli argomenti forniti dal planner contengano
@@ -808,7 +1079,7 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
                 result = None
                 if hasattr(sel, "ainvoke"):
                     try:
-                        result = await asyncio.wait_for(sel.ainvoke(args), timeout=int(os.getenv("MCP_TOOL_TIMEOUT","25")))
+                        result = await asyncio.wait_for(sel.ainvoke(args), timeout=int(os.getenv("TOOL_TIMEOUT","25")))
                     except asyncio.TimeoutError:
                         logger.warning(f"node_call_tool: {name} timed out")
                         result = "error: tool timeout"
@@ -953,110 +1224,34 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, mcp_to
         except Exception:
             logger.exception("checkpoint save failed")
 
-        # logging Q/A via MCP write tool (MCP-only; with retries and namespace support)
+        # Automatic answer logging to Neo4j after synthesis
         try:
-            q_text = (state.get("question") or "").strip()
-            if not q_text:
-                # fallback: prendi l'ultimo HumanMessage dalla chat_history
-                try:
-                    chat = state.get("chat_history", []) or []
-                    for item in reversed(chat):
-                        if isinstance(item, HumanMessage):
-                            ct = getattr(item, "content", None)
-                            if isinstance(ct, str) and ct.strip():
-                                q_text = ct.strip()
-                                break
-                except Exception:
-                    pass
-            if q_text and isinstance(final, str) and final.strip():
-                ans_id = f"ans-{uuid.uuid4().hex[:12]}"
-                # Truncate answer AGGRESSIVELY to reduce payload pressure on stdio transport during MCP write
-                # stdio buffers are small; keep payloads minimal
-                try:
-                    max_chars = int(os.getenv("MCP_WRITE_MAX_CHARS", "500"))
-                except Exception:
-                    max_chars = 500
-                safe_answer = final[:max_chars]
-                # Simplified Cypher: reduce query complexity to minimize stdio payload size
-                cypher = (
-                    "MERGE (u:User {id: $uid}) "
-                    "MERGE (d:Document {filename: $fn}) "
-                    "MERGE (q:Question {text: $qt}) "
-                    "ON CREATE SET q.created_at = datetime() "
-                    "CREATE (a:Answer {id: $aid, text: $at, created_at: datetime()}) "
-                    "MERGE (u)-[:ASKED]->(q) "
-                    "MERGE (q)-[:IS_RELATED_TO]->(d) "
-                    "MERGE (q)-[:HAS_ANSWER]->(a)"
+            global _global_last_search_metadata
+            current_question = state.get("question", "")
+            current_filename = _global_active_filename or ""
+            current_user_id = _global_user_id or "default_user"
+            
+            if current_question and current_question.strip() and current_filename and final:
+                # Get chunk metadata from global variable (populated by tools)
+                external_chunks = _global_last_search_metadata.get("external_chunks", [])
+                primary_chunks = _global_last_search_metadata.get("primary_chunks", [])
+                
+                logger.info(f"node_synth: logging answer to Neo4j: user={current_user_id}, file={current_filename}, q='{current_question[:50]}...', external_chunks={len(external_chunks)}, primary_chunks={len(primary_chunks)}")
+                _log_answer_to_neo4j(
+                    question=current_question,
+                    answer=final,
+                    user_id=current_user_id,
+                    filename=current_filename,
+                    external_chunks=external_chunks if external_chunks else None,
+                    primary_chunks=primary_chunks if primary_chunks else None
                 )
-                params = {
-                    "uid": _global_user_id or "default_user",
-                    "fn": _global_active_filename or "unknown",
-                    "qt": q_text[:300],  # Truncate question too to reduce payload
-                    "aid": ans_id,
-                    "at": safe_answer,
-                }
-                try:
-                    # Decide whether to run in background to avoid blocking final answer delivery
-                    # IMPORTANT: Background tasks may be orphaned if event loop closes too early
-                    # For debugging, set MCP_WRITE_ASYNC=0 to run synchronously and see actual errors
-                    run_bg = os.getenv("MCP_WRITE_ASYNC", "0") != "0"  # Default to synchronous (0) for reliability
-                    # use question+filename as a dedup key to avoid multiple writes for same Q in a loop
-                    dedup_key = f"{(_global_active_filename or 'unknown')}::{q_text.strip()}"
-                    now_ts = time.time()
-                    last_ts = _inflight_mcp_writes.get(dedup_key)
-                    # if a recent inflight write exists within 120s, skip scheduling another
-                    if last_ts and now_ts - last_ts < 120:
-                        logger.info("node_synth: MCP write already in-flight recently for this Q; skipping duplicate schedule")
-                    else:
-                        _inflight_mcp_writes[dedup_key] = now_ts
-                        logger.info(
-                            f"node_synth: logging Q/A via MCP; q_preview='{q_text[:80].replace('\n',' ')}' ans_len={len(params['at'])} bg={run_bg}"
-                        )
-                        if run_bg:
-                            # background timeouts are typically longer; support env override
-                            ts_env = os.getenv("MCP_WRITE_TIMEOUTS_BACKGROUND", "")
-                            timeouts_bg = None
-                            if ts_env.strip():
-                                try:
-                                    timeouts_bg = [float(x.strip()) for x in ts_env.split(",") if x.strip()]
-                                except Exception:
-                                    timeouts_bg = None
-                            if not timeouts_bg:
-                                timeouts_bg = [60.0, 120.0, 180.0]
-
-                            async def _bg_write():
-                                try:
-                                    logger.info("node_synth: background MCP write task started")
-                                    await _mcp_write_with_retry(tools, cypher, params, timeouts=timeouts_bg)
-                                    logger.info("node_synth: background MCP write task completed successfully")
-                                except Exception as e:
-                                    logger.exception(f"node_synth: background MCP Q/A logging failed after retries: {e}")
-                                finally:
-                                    try:
-                                        _inflight_mcp_writes.pop(dedup_key, None)
-                                    except Exception:
-                                        pass
-
-                            # Create task and store reference to prevent garbage collection
-                            task = asyncio.create_task(_bg_write())
-                            # Give task a moment to start before continuing
-                            try:
-                                await asyncio.sleep(0.05)
-                            except Exception:
-                                pass
-                        else:
-                            # Synchronous execution - blocks until complete but ensures write finishes
-                            logger.info("node_synth: executing MCP write synchronously (blocking)")
-                            try:
-                                await _mcp_write_with_retry(tools, cypher, params)
-                                logger.info("node_synth: synchronous MCP write completed")
-                            finally:
-                                _inflight_mcp_writes.pop(dedup_key, None)
-                except Exception as e:
-                    # MCP-only policy: do not fallback; surface telemetry
-                    logger.exception(f"node_synth: MCP Q/A logging scheduling failed: {e}")
+                
+                # Clear metadata for next question
+                _global_last_search_metadata = {}
+            else:
+                logger.warning(f"node_synth: skipping answer logging - missing data (question={bool(current_question)}, filename={bool(current_filename)}, answer={bool(final)})")
         except Exception:
-            logger.exception("node_synth: unexpected error while preparing MCP Q/A logging")
+            logger.exception("node_synth: automatic answer logging failed (non-critical)")
 
         # go to end by returning chat_history with final ai message
         # include a final_content marker to ensure callers can detect final answer regardless of stream shape
