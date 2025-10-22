@@ -452,7 +452,12 @@ if st.session_state.pdf_uploaded and st.session_state.agent_app:
                             st.session_state.thread_id = session_thread
 
                         # Use persistent session thread id as the LangGraph thread key
-                        cfg = {"configurable": {"thread_id": session_thread}}
+                        cfg = {
+                            "configurable": {
+                                "thread_id": session_thread
+                            },
+                            "recursion_limit": 50  # Increase from default 25 to handle complex workflows
+                        }
 
                         # pass the current chat_history directly; let LangGraph + InMemorySaver
                         response_content = loop.run_until_complete(

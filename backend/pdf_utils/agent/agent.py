@@ -631,16 +631,32 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, checkp
             out_str = getattr(res, "content", None) or str(res)
         except Exception:
             out_str = str(res)
+        
+        # Heuristic: Check if presearch results seem insufficient
+        needs_cross_document = False
+        if isinstance(out_str, str):
+            # Check for signs of insufficient results
+            if "no_results" in out_str.lower() or len(out_str.strip()) < 50:
+                needs_cross_document = True
+                logger.info("node_presearch: detected insufficient results (no_results or too short) - suggesting cross_document_search")
+            # Check if results are generic/unhelpful (common pattern: very short chunks)
+            elif out_str.count("[") <= 1:  # Less than 2 chunks returned
+                needs_cross_document = True
+                logger.info("node_presearch: detected low chunk count - suggesting cross_document_search")
+        
         try:
-            meta = json.dumps({"q": q}, ensure_ascii=False)
+            meta_data = {"q": q, "needs_cross_document": needs_cross_document}
+            meta = json.dumps(meta_data, ensure_ascii=False)
             tm_content = f"__PRESEARCH__{meta}\n{out_str}"
         except Exception:
             tm_content = f"__PRESEARCH__{json.dumps({'q': str(q)})}\n{out_str}"
+        
         tm = ToolMessage(content=tm_content, tool_call_id=f"presearch-{uuid.uuid4().hex[:8]}")
         result = {
             "chat_history": state.get("chat_history", []) + [tm], 
             "question": q,
-            "intermediate_steps": state.get("intermediate_steps", [])
+            "intermediate_steps": state.get("intermediate_steps", []),
+            "needs_cross_document": needs_cross_document  # Pass hint to planner
         }
         return result
 
@@ -650,10 +666,32 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, checkp
         logger.debug(f"node_planner: processing question='{q}', state_keys={list(state.keys())}")
         if not q or not q.strip():
             logger.error(f"node_planner: question is empty! Full state={state}")
+        
+        # Check if presearch suggests we need cross-document search
+        needs_cross_document = state.get("needs_cross_document", False)
+        
         # loop guard: read last tool metadata from state
         loop_meta = state.get("tool_loop_meta") or {}
         last_tool = loop_meta.get("last_tool")
         same_tool_count = int(loop_meta.get("same_tool_count", 0))
+        
+        # HEURISTIC: If presearch detected insufficient results and we haven't called cross_document_search yet,
+        # force it automatically (bypass planner decision)
+        if needs_cross_document and last_tool != "cross_document_search":
+            logger.info("node_planner: FORCING cross_document_search due to insufficient presearch results")
+            forced_tid = f"tc-forced-cross-{uuid.uuid4().hex[:8]}"
+            forced_step = {
+                "name": "cross_document_search",
+                "args": {"question": q, "max_chunks": 5},
+                "id": forced_tid
+            }
+            return {
+                "chat_history": state.get("chat_history", []),
+                "question": q,
+                "intermediate_steps": [forced_step],
+                "tool_loop_meta": {"last_tool": "cross_document_search", "same_tool_count": 1}
+            }
+        
         allowed_tools_list = ", ".join([getattr(t, 'name', None) or getattr(t, '__name__', str(t)) for t in tools])
         #raccoglie l'ultimo output PRESEARCH per informare il planner
         presearch_output = ""
@@ -690,6 +728,12 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, checkp
         #costruisce un prompt rigido: il planner DEVE emettere un singolo oggetto JSON e nient'altro
         prompt_parts = []
         prompt_parts.append("You are an intelligent planner that decides which tools to call. OUTPUT ONLY ONE JSON OBJECT.\n\n")
+        
+        # Add loop warning if approaching limit
+        if same_tool_count >= MAX_SAME_TOOL - 1:
+            prompt_parts.append(f"⚠️ WARNING: Tool '{last_tool}' has been called {same_tool_count} times consecutively. "
+                              f"DO NOT call it again. Either use a different tool or return empty tool_calls to proceed to answer generation.\n\n")
+        
         prompt_parts.append("Available tools:\n")
         prompt_parts.append("1. 'log_conversation': Record this question in the knowledge graph. Call FIRST if important.\n")
         prompt_parts.append("2. 'neo4j_vector_search': Search current document chunks. Primary tool for context.\n")
@@ -698,8 +742,9 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, checkp
         prompt_parts.append("5. 'write_neo4j_cypher': Execute write Cypher queries.\n\n")
         prompt_parts.append("Strategy:\n")
         prompt_parts.append("- Start with 'neo4j_vector_search' on current document (already done in presearch).\n")
-        prompt_parts.append("- If presearch results seem INCOMPLETE or INSUFFICIENT, call 'cross_document_search' to find info in related documents.\n")
-        prompt_parts.append("- Use 'cross_document_search' when: presearch has low scores, missing key info, or question asks about topics not well covered in current doc.\n")
+        prompt_parts.append("- If presearch results seem INCOMPLETE or INSUFFICIENT, call 'cross_document_search' ONCE to find info in related documents.\n")
+        prompt_parts.append("- DO NOT call the same tool multiple times in a row. If you already called it, move on.\n")
+        prompt_parts.append("- After getting external document info from cross_document_search, proceed to answer generation by returning empty tool_calls.\n")
         prompt_parts.append("- When you have enough context, return empty tool_calls to generate answer.\n\n")
         prompt_parts.append("Rules:\n")
         prompt_parts.append("- Output ONLY: {\"tool_calls\": []} OR {\"tool_calls\": [{\"name\": \"tool\", \"args\": {...}}]}\n")
@@ -989,7 +1034,9 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, checkp
         else:
             same_tool_count = 1
         new_loop_meta = {"last_tool": next_tool, "same_tool_count": same_tool_count}
-        if next_tool.lower() == "neo4j_vector_search" and same_tool_count > MAX_SAME_TOOL:
+        
+        # Guard against ANY tool being called too many times consecutively
+        if same_tool_count > MAX_SAME_TOOL:
             logger.warning(f"node_planner: detected {same_tool_count} consecutive '{next_tool}' calls; switching to synth to avoid recursion")
             return {"chat_history": state.get("chat_history", []), "question": q, "tool_loop_meta": new_loop_meta, "synth": True}
 
