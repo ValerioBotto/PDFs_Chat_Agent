@@ -123,11 +123,7 @@ class GraphDB:
         }
         return self.run_query(query, parameters)
         
-    def create_vector_index(self, index_name: str, node_label: str, property_name: str, vector_dimensions: int):
-        """
-        Creates a vector index for similarity search using the vector-2.0 provider
-        """
-        
+    def create_vector_index(self, index_name: str, node_label: str, property_name: str, vector_dimensions: int):        
         query = f"""
         CREATE VECTOR INDEX {index_name} IF NOT EXISTS 
         FOR (n:{node_label})
@@ -148,9 +144,6 @@ class GraphDB:
             raise
     
     def add_topic_to_neo4j(self, topic_name: str, filename: str = None):
-        """
-        crea un nodo Topic e lo collega a un Documento (se filename fornito).
-        """
         query = """
         MERGE (t:Topic {name: toLower($topic_name)})
         ON CREATE SET t.created_at = datetime()
@@ -170,7 +163,6 @@ class GraphDB:
 
     # ------- SINONIMI DINAMICI -------
     def add_synonyms(self, canonical: str, synonyms: list[str]):
-        """Salva sinonimi collegandoli al Topic canonico."""
         if not canonical or not synonyms:
             return None
         query = """
@@ -190,7 +182,6 @@ class GraphDB:
         return self.run_query(query, params)
 
     def get_canonical_topic(self, name: str) -> str | None:
-        """Risolve un nome in un Topic canonico via match diretto o Synonym (case-insensitive)."""
         if not name:
             return None
         query = """
@@ -216,7 +207,6 @@ class GraphDB:
         return None
 
     def load_synonym_map(self, filename: str | None = None) -> dict[str, str]:
-        """Ritorna {synonym -> canonical}. Se filename è dato, include solo sinonimi dei topic collegati a quel documento."""
         if filename:
             query = """
             MATCH (d:Document {filename: $filename})-[:HAS_TOPIC]->(t:Topic)
@@ -248,9 +238,6 @@ class GraphDB:
         return out
 
     def add_entity_to_neo4j(self, entity_type: str, entity_name: str, filename: str = None, chunk_id: str = None):
-        """
-        crea un nodo Entity con una proprietà 'type' e lo collega a un Documento/Chunk.
-        """
         #Creiamo un nodo generico :Entity e usiamo la proprietà 'type' per il tipo specifico
         query = f"""
         MERGE (e:Entity {{name: $entity_name, type: $entity_type_prop}})
@@ -278,9 +265,6 @@ class GraphDB:
         return self.run_query(query, params)
         
     def link_topics_to_entity(self, entity_name: str, topic_names: List[str]):
-        """
-        Collega un'entità a uno o più topic a cui è correlata.
-        """
         if not topic_names:
             return
 
@@ -298,11 +282,7 @@ class GraphDB:
         return self.run_query(query, params)
     
     def query_vector_index(self, index_name: str, query_embedding: List[float], k: int = 5, filename: Any = None) -> List[Dict[str, Any]]:
-        """
-        esegue una ricerca di similarità vettoriale sull'indice neo4j.
-        restituisce una lista di dizionari contenenti il contenuto del nodo
-        e il punteggio di similarità.
-        """
+
         #procedura db.index.vector.queryNodes per interrogare indici vettoriali in Neo4j.
         if filename:
             query = f"""
@@ -339,12 +319,6 @@ class GraphDB:
             raise    
 
     def log_question_answer(self, user_id: str, filename: str, question_text: str, answer_id: str, answer_text: str):
-        """
-        Registra una domanda dell'utente e la risposta dell'agente collegandole al documento corrente.
-        - Crea/Merge User e Document
-        - Merge della Question per (text, filename) per evitare duplicati per documento
-        - Crea sempre un nuovo Answer con id univoco e collega (Question)-[:HAS_ANSWER]->(Answer)
-        """
         if not question_text or not filename:
             return None
         query = """

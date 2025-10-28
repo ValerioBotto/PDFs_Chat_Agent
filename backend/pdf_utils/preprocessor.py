@@ -3,7 +3,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 def split_sections_with_layout(doc) -> dict:
-    #unzione per suddividere il documento in sezioni logiche usando le label fornite da spacylayout
+    #funzione per suddividere il documento in sezioni logiche usando le label fornite da spacylayout
     
     sections = {}
     current_title = "introduzione" # titolo iniziale predefinito per il primo blocco di testo

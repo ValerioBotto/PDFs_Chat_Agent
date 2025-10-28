@@ -1,7 +1,3 @@
-"""
-Context Helper per ricerca cross-document intelligente.
-Permette all'agente di cercare informazioni in documenti correlati quando il documento corrente non contiene abbastanza informazioni.
-"""
 import logging
 from typing import List, Dict, Any
 
@@ -9,34 +5,13 @@ logger = logging.getLogger(__name__)
 
 
 class ContextHelper:
-    """
-    Helper per arricchire il contesto dell'agente con informazioni da documenti correlati.
-    Usa una strategia ibrida: topic matching + vector similarity search.
-    """
     
     def __init__(self, graph_db, indexer):
-        """
-        Inizializza il ContextHelper.
-        
-        Args:
-            graph_db: Istanza di GraphDB per query Cypher
-            indexer: Istanza di Indexer per embeddings e vector search
-        """
         self.graph_db = graph_db
         self.indexer = indexer
         logger.info("ContextHelper inizializzato")
     
     def find_documents_by_topics(self, current_filename: str, max_docs: int = 5) -> List[str]:
-        """
-        Trova documenti che condividono almeno un topic con il documento corrente.
-        
-        Args:
-            current_filename: Nome del documento corrente
-            max_docs: Numero massimo di documenti da ritornare
-            
-        Returns:
-            Lista di filename di documenti correlati (esclude il documento corrente)
-        """
         try:
             #query: trova documenti con topic in comune
             query = """
@@ -76,17 +51,6 @@ class ContextHelper:
         target_filenames: List[str], 
         k: int = 5
     ) -> List[Dict[str, Any]]:
-        """
-        Esegue vector search limitata a specifici documenti.
-        
-        Args:
-            query: Testo della domanda da cercare
-            target_filenames: Lista di filename dove cercare
-            k: Numero di chunk da ritornare per documento
-            
-        Returns:
-            Lista di chunk con metadata (filename, chunk_id, content, score)
-        """
         if not target_filenames:
             logger.warning("Nessun documento target specificato per la ricerca")
             return []
@@ -142,24 +106,6 @@ class ContextHelper:
         question: str, 
         max_external_chunks: int = 5
     ) -> Dict[str, Any]:
-        """
-        METODO PRINCIPALE: Arricchisce il contesto con informazioni da documenti correlati.
-        Strategia ibrida:
-        1. Trova documenti con topic simili (phase 1: topic filtering)
-        2. Esegue vector search su questi documenti (phase 2: similarity search)
-        3. Ritorna i chunk più rilevanti con metadata chiare
-        
-        Args:
-            current_filename: Nome del documento corrente
-            question: Domanda dell'utente
-            max_external_chunks: Numero massimo di chunk esterni da includere
-            
-        Returns:
-            Dizionario con:
-            - related_documents: lista di filename usati
-            - external_chunks: lista di chunk trovati con metadata
-            - summary: stringa formattata per il planner
-        """
         logger.info(f"Arricchimento contesto per documento '{current_filename}'")
         
         #fase 1: trova documenti correlati per topic
@@ -223,17 +169,6 @@ class ContextHelper:
         used_documents: List[str], 
         current_filename: str
     ) -> str:
-        """
-        Formatta la risposta finale indicando esplicitamente le fonti utilizzate.
-        
-        Args:
-            answer: Risposta generata dall'agente
-            used_documents: Lista di documenti esterni utilizzati
-            current_filename: Nome del documento corrente
-            
-        Returns:
-            Risposta formattata con indicazione delle fonti
-        """
         if not used_documents:
             return answer
         
@@ -251,14 +186,6 @@ class ContextHelper:
         answer_id: str,
         external_chunks: List[Dict[str, Any]]
     ) -> None:
-        """
-        Crea relazioni ENRICHED_BY tra Answer e documenti esterni usati.
-        Include metadata sui chunk specifici usati (chunk_ids, scores).
-        
-        Args:
-            answer_id: ID hash della risposta (Answer.id)
-            external_chunks: Lista di chunk esterni da enrich_context_with_related_docs
-        """
         if not external_chunks:
             logger.debug("Nessun chunk esterno da loggare")
             return
@@ -313,19 +240,11 @@ class ContextHelper:
         primary_chunks: List[Dict],
         current_filename: str
     ) -> None:
-        """
-        Crea relazione (Answer)-[:ENRICHED_BY]->(Document) per il documento corrente.
-        
-        Args:
-            answer_id: ID hash della risposta
-            primary_chunks: Lista di dict con chunk_id, filename, score
-            current_filename: Nome del documento corrente
-        """
         if not primary_chunks or not current_filename:
             logger.debug("Nessun chunk primario da loggare")
             return
         
-        # Estrai chunk IDs e scores
+        #estrai chunk IDs e scores
         chunk_ids = [str(c.get("chunk_id", "?")) for c in primary_chunks]
         chunk_scores = [float(c.get("score", 0.0)) for c in primary_chunks]
         

@@ -32,9 +32,7 @@ class Indexer:
         return self.embedding_model.encode(text).tolist()
 
     def index_chunks_to_neo4j(self, filename: str, chunks: List[LangchainDocument]):
-        """
-        processa una lista di chunk, genera gli embedding e li salva in neo4j.
-        """
+        
         if not chunks:
             logger.warning("no chunks provided for indexing.")
             return

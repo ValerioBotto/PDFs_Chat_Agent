@@ -1,15 +1,5 @@
 [
   {
-    "question": "Ciao mi chiamo valerio, mi spieghi cos'è il dispositivo?",
-    "answer": "Ciao Valerio, il dispositivo sembra essere un apparecchio elettronico con funzionalità di controllo e programmazione, probabilmente utilizzato per gestire alcune operazioni in modo automatico (chunk:programma impulso, con un on di 5 secondi che inizia alle 11:30 per tutta la settimana_0). Ha una scheda di montaggio indipendente (chunk:montaggio_0) e necessita di una tensione di alimentazione specifica (chunk:installazione_1). Inoltre, dispone di una riserva di funzionamento garantita da una pila al litio (chunk:messa in funzione_0). Tuttavia, senza ulteriori informazioni, non è possibile fornire una descrizione più dettagliata del dispositivo (chunk:caratteristiche tecniche_0).",
-    "ts": 1759827057
-  },
-  {
-    "question": "ciao come funziona il dispositivo?",
-    "answer": "Il dispositivo funziona collegandolo alla rete e verificando la tensione di alimentazione prima di procedere (chunk:installazione_1 | file:test.pdf). Una volta alimentato, il display si illumina e visualizza la schermata principale (chunk:messa in funzione_0 | file:test.pdf). È importante rispettare la posizione di Fase e Neutro durante il collegamento per evitare guasti (chunk:connessione_0 | file:test.pdf). Inoltre, il dispositivo può essere programmato per diverse operazioni, con un ordine di precedenza ben definito (chunk:programma impulso, con un on di 5 secondi che inizia alle 11:30 per tutta la settimana_0 | file:test.pdf).",
-    "ts": 1759830957
-  },
-  {
     "question": "Di cosa parla il documento?",
     "answer": "Non posso fornire informazioni sul documento in questione, poiché non sono state fornite informazioni specifiche sul documento stesso (chunk:nessuno). Se puoi fornire maggiori dettagli o chiarire a quale documento ti riferisci, sarò felice di aiutarti con le informazioni in mio possesso.",
     "ts": 1759997103
@@ -248,5 +238,15 @@
     "question": "Quali sono le scadenze per laurearsi a novembre?",
     "answer": "Le scadenze per laurearsi a novembre includono: \n\n- 25 settembre 2025: Compilazione domanda on line (Portale Studente).\n- Dal 26 settembre al 27 ottobre 2025: Consegna frontespizio, abstract e dichiarazione informata (consegna obbligatoria tramite email all'indirizzo lauree.disum@gmail.com. \n- Dal 3 al 10 novembre 2025: Compilazione questionario on line (Disum).\n- 13 novembre 2025: Ultimo esame e caricamento della tesi/elaborato finale in pdf/A (Portale Studente).\n- 15 novembre 2025: Validazione on line del pdf della tesi/elaborato finale (scadenza solo per i docenti relatori/relatrici) (chunk:avviso per i/le laureandi/e scadenze lauree per appello ordinario sessione di novembre 2025_1).",
     "ts": 1761147933
+  },
+  {
+    "question": "Di cosa parla il pdf?",
+    "answer": "Il pdf parla di una definizione per l'infezione cronica da Pseudomonas aeruginosa nei pazienti con fibrosi cistica. Sono presentati risultati di uno studio che valuta la validità di una nuova definizione per l'infezione cronica da P. aeruginosa, considerando le categorie di pazienti in base alla presenza o assenza di P. aeruginosa nei campioni di sputo o secrezioni respiratorie durante i 12 mesi precedenti (chunk:1. introduction_11 | file:Evaluation of a new definition for chronic Pseudomonas aerugin.pdf).",
+    "ts": 1761227906
+  },
+  {
+    "question": "Di cosa parla il pdf?",
+    "answer": "Il PDF parla dello sviluppo di un agente conversazionale per documenti PDF, progettato per supportare l'estrazione e la sintesi di informazioni in domini caratterizzati da un'elevata densità informativa, utilizzando paradigmi dell'Agentic AI e Retrieval-Augmented Generation (chunk:università degli studi di catania_2, chunk:università degli studi di catania_5).",
+    "ts": 1761659102
   }
 ]

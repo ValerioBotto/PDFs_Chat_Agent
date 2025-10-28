@@ -35,12 +35,8 @@ try:
 except Exception:
     MAX_SAME_TOOL = 3
 
-def _extract_json_object_with_key(text: str, key: str = "tool_calls") -> Optional[Dict[str, Any]]:
-    """Estrae l’ultimo oggetto JSON bilanciato da un testo che contiene una certa chiave.
-    Per farlo, cerca l’apertura di parentesi più vicina all’ultima occorrenza della chiave e conta
-    le parentesi fino a trovare quella di chiusura corrispondente, gestendo correttamente stringhe ed escape.
-    Restituisce il dizionario se valido, altrimenti None.
-    """
+#estrae l'ultimo oggetto JSON bilanciato da un testo che contiene una certa chiave
+def _extract_json_object_with_key(text: str, key: str = "tool_calls") -> Optional[Dict[str, Any]]:   
     if not text or key not in text:
         return None
     try:
@@ -123,7 +119,7 @@ _global_indexer: Optional[Indexer] = None
 _global_active_filename: Optional[str] = None
 _global_user_id: Optional[str] = None
 _firewall_llm: Optional[ChatTogether] = None
-_global_last_search_metadata: Dict[str, Any] = {}  # Track metadata from last search
+_global_last_search_metadata: Dict[str, Any] = {} 
  
 
 def initialize_agent_tools_resources(graph_db: GraphDB, indexer: Indexer, active_filename: Optional[str] = None, user_id: Optional[str] = None):
@@ -259,21 +255,20 @@ def neo4j_vector_search(query: str, k: int = DEFAULT_K) -> str:
     logger.info(f"neo4j_vector_search: searching for: {query} (k={k}) filename_scope={_global_active_filename}")
     try:
         emb = _global_indexer.generate_embeddings(query)
-        # Migliora il recall per documento: aumenta k e fallback a ricerca non filtrata poi filtrata
+        #aumenta k
         target_file = _global_active_filename
         base_k = max(1, int(k) if isinstance(k, (int, float, str)) else DEFAULT_K)
         results = []
-        # 1) Prova scoped con k aumentato per includere candidati del documento specifico
+        #1)Prova scoped con k aumentato per includere candidati del documento specifico
         try:
             if target_file:
                 results = _global_graph_db.query_vector_index(
                     "chunk_embeddings_index", emb, k=max(base_k * 4, 25), filename=target_file
                 )
         except TypeError:
-            # driver firmato diversamente: esegui unscoped e filtra
             pass
 
-        # 2) Se ancora vuoto, fallback: unscoped, poi filtra per filename
+        #2)Se ancora vuoto, fallback: unscoped, poi filtra per filename
         if not results:
             try:
                 unscoped = _global_graph_db.query_vector_index("chunk_embeddings_index", emb, k=max(base_k * 6, 50))
@@ -286,7 +281,6 @@ def neo4j_vector_search(query: str, k: int = DEFAULT_K) -> str:
             _global_last_search_metadata["primary_chunks"] = []
             return "no_results"
         
-        # Save metadata for relationship tracking
         primary_chunks = []
         for r in results:
             primary_chunks.append({
@@ -316,7 +310,7 @@ def _run_cypher(query: str, params: Optional[Dict[str, Any]] = None):
     fn = getattr(_global_graph_db, "run_query", None)
     if callable(fn):
         return fn(query, params or {})
-    # fallback ad altri nomi per compatibilità
+    #fallback ad altri nomi per compatibilità (non serve, potrei toglierla)
     for cand in ("run_cypher", "execute_cypher", "run"):
         f = getattr(_global_graph_db, cand, None)
         if callable(f):
@@ -328,7 +322,6 @@ def _run_cypher(query: str, params: Optional[Dict[str, Any]] = None):
 
 
 def _fetch_rows(query: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-    """Esegue una query e restituisce una lista di rows (dict) in modo robusto."""
     rows: List[Dict[str, Any]] = []
     res = None
     try:
@@ -410,7 +403,7 @@ def log_conversation(question: Optional[str] = None, user_id: Optional[str] = No
         if not fname:
             return "error: missing filename"
 
-        # Check if question already exists
+        #Controlla se la domanda già è stata fatta e quindi esiste
         rows = _fetch_rows(
             """
             MATCH (u:User {id: $user_id})-[:ASKED]->(q:Question {text: $question})-[:IS_RELATED_TO]->(d:Document {filename: $filename})
@@ -422,7 +415,7 @@ def log_conversation(question: Optional[str] = None, user_id: Optional[str] = No
         if len(rows) > 0:
             return "already_logged"
 
-        # Create new question node and relationships
+        # Crea un nuovo nodo domanda e relazioni
         _run_cypher(
             """
             MERGE (u:User {id: $user_id})
@@ -451,7 +444,6 @@ def _log_answer_to_neo4j(
     external_chunks: Optional[List[Dict]] = None,
     primary_chunks: Optional[List[Dict]] = None
 ):
-    """Internal function to log the answer after synthesis (not exposed as a tool)."""
     try:
         uid = (user_id or _global_user_id or "default_user")
         qtext = question.strip()
@@ -462,7 +454,7 @@ def _log_answer_to_neo4j(
             logger.warning(f"_log_answer_to_neo4j: missing data (q={bool(qtext)}, f={bool(fname)}, a={bool(atext)})")
             return
 
-        # First ensure question exists
+        #Prima si assicura che la domanda esista
         _run_cypher(
             """
             MERGE (u:User {id: $user_id})
@@ -478,10 +470,9 @@ def _log_answer_to_neo4j(
             {"user_id": uid, "question": qtext, "filename": fname},
         )
 
-        #Then add answer
+        #poi aggiugne la risposta
         import hashlib
-        ahash = hashlib.sha256(atext.encode("utf-8")).hexdigest()[:16]  # shorter hash
-        
+        ahash = hashlib.sha256(atext.encode("utf-8")).hexdigest()[:16]
         _run_cypher(
             """
             MATCH (q:Question {text: $question})
@@ -495,7 +486,7 @@ def _log_answer_to_neo4j(
         
         logger.info(f"_log_answer_to_neo4j: answer logged successfully for question '{qtext[:50]}...'")
         
-        # Track document usage with ENRICHED_BY relationships
+        #relazione enriched_by
         if external_chunks or primary_chunks:
             if _global_graph_db is None or _global_indexer is None:
                 logger.warning("Cannot track ENRICHED_BY: graph_db or indexer not initialized")
@@ -518,17 +509,7 @@ def _log_answer_to_neo4j(
 
 @tool(description="cross_document_search: Search for relevant information across ALL documents in the knowledge graph that share topics with the current document. Use this when the current document does not contain sufficient information to fully answer the question. Returns chunks from related documents with explicit source attribution.")
 def cross_document_search(question: str, max_chunks: int = 5) -> str:
-    """
-    Cerca informazioni in documenti correlati al documento corrente.
-    Usa strategia ibrida: topic matching + vector similarity.
-    
-    Args:
-        question: Domanda dell'utente
-        max_chunks: Numero massimo di chunk da ritornare (default 5)
-        
-    Returns:
-        Stringa formattata con chunk rilevanti e fonti esplicite
-    """
+
     global _global_last_search_metadata
     if _global_graph_db is None or _global_indexer is None:
         logger.error("cross_document_search chiamato prima dell'inizializzazione")
@@ -552,7 +533,6 @@ def cross_document_search(question: str, max_chunks: int = 5) -> str:
             max_external_chunks=max_chunks
         )
         
-        # Save external chunks metadata for relationship tracking
         external_chunks = result.get("external_chunks", [])
         if external_chunks:
             _global_last_search_metadata["external_chunks"] = external_chunks
@@ -631,16 +611,16 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, checkp
             out_str = getattr(res, "content", None) or str(res)
         except Exception:
             out_str = str(res)
-        
-        # Heuristic: Check if presearch results seem insufficient
+
+        # euristica: Controlla se i risultati della presearch sembrano insufficient
         needs_cross_document = False
         if isinstance(out_str, str):
-            # Check for signs of insufficient results
+            #Controlla se non ci sono risultati
             if "no_results" in out_str.lower() or len(out_str.strip()) < 50:
                 needs_cross_document = True
                 logger.info("node_presearch: detected insufficient results (no_results or too short) - suggesting cross_document_search")
-            # Check if results are generic/unhelpful (common pattern: very short chunks)
-            elif out_str.count("[") <= 1:  # Less than 2 chunks returned
+            
+            elif out_str.count("[") <= 1:  
                 needs_cross_document = True
                 logger.info("node_presearch: detected low chunk count - suggesting cross_document_search")
         
@@ -656,7 +636,7 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, checkp
             "chat_history": state.get("chat_history", []) + [tm], 
             "question": q,
             "intermediate_steps": state.get("intermediate_steps", []),
-            "needs_cross_document": needs_cross_document  # Pass hint to planner
+            "needs_cross_document": needs_cross_document 
         }
         return result
 
@@ -667,16 +647,15 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, checkp
         if not q or not q.strip():
             logger.error(f"node_planner: question is empty! Full state={state}")
         
-        # Check if presearch suggests we need cross-document search
+        #controlla se la presearch suggerisce una cross document search
         needs_cross_document = state.get("needs_cross_document", False)
         
-        # loop guard: read last tool metadata from state
+        #piccolo "loop guard" per evitare chiamate infinite allo stesso tool
         loop_meta = state.get("tool_loop_meta") or {}
         last_tool = loop_meta.get("last_tool")
         same_tool_count = int(loop_meta.get("same_tool_count", 0))
         
-        # HEURISTIC: If presearch detected insufficient results and we haven't called cross_document_search yet,
-        # force it automatically (bypass planner decision)
+        #euristica: forza la cross_document_search se necessario
         if needs_cross_document and last_tool != "cross_document_search":
             logger.info("node_planner: FORCING cross_document_search due to insufficient presearch results")
             forced_tid = f"tc-forced-cross-{uuid.uuid4().hex[:8]}"
@@ -729,9 +708,9 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, checkp
         prompt_parts = []
         prompt_parts.append("You are an intelligent planner that decides which tools to call. OUTPUT ONLY ONE JSON OBJECT.\n\n")
         
-        # Add loop warning if approaching limit
+        
         if same_tool_count >= MAX_SAME_TOOL - 1:
-            prompt_parts.append(f"⚠️ WARNING: Tool '{last_tool}' has been called {same_tool_count} times consecutively. "
+            prompt_parts.append(f"WARNING: Tool '{last_tool}' has been called {same_tool_count} times consecutively. "
                               f"DO NOT call it again. Either use a different tool or return empty tool_calls to proceed to answer generation.\n\n")
         
         prompt_parts.append("Available tools:\n")
@@ -780,7 +759,7 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, checkp
             text = ""
             tool_calls = None
 
-    #Debugging e fallback vario con copilot
+    #Debugging e fallback vario con  aiuto di copilot
         # try to parse JSON fragments if planner emitted them in text. Prefer direct tool_calls
         # attribute; otherwise, use a robust balanced-brace extractor to get the last JSON object
         # that contains "tool_calls". Fall back to whole-text json parsing.
@@ -1035,7 +1014,6 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, checkp
             same_tool_count = 1
         new_loop_meta = {"last_tool": next_tool, "same_tool_count": same_tool_count}
         
-        # Guard against ANY tool being called too many times consecutively
         if same_tool_count > MAX_SAME_TOOL:
             logger.warning(f"node_planner: detected {same_tool_count} consecutive '{next_tool}' calls; switching to synth to avoid recursion")
             return {"chat_history": state.get("chat_history", []), "question": q, "tool_loop_meta": new_loop_meta, "synth": True}
@@ -1056,7 +1034,7 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, checkp
         name = tc.get("name")
         args = tc.get("args", {})
         tid = tc.get("id")
-        # pulisce e valida gli argomenti per neo4j_vector_search
+        #pulisce e valida gli argomenti per neo4j_vector_search
         try:
             if isinstance(name, str) and "neo4j_vector_search" in name.lower() and isinstance(args, dict):
                 qval = args.get("query")
@@ -1074,7 +1052,7 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, checkp
                         args["k"] = args_k_int
                     except Exception:
                         args["k"] = DEFAULT_K
-            # auto-fill per log_conversation
+            #auto-fill per log_conversation
             if isinstance(name, str) and "log_conversation" in name.lower() and isinstance(args, dict):
                 if not args.get("user_id"):
                     args["user_id"] = _global_user_id or "default_user"
@@ -1092,8 +1070,8 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, checkp
             logger.exception("node_call_tool: error sanitizing args")
 
         # se lo strumento è neo4j_vector_search, cerca sempre utilizzando la
-        # domanda attuale dello stato. Questo impedisce che gli argomenti forniti dal planner contengano
-        # query precedenti o JSON incorporato che causano ricerche ripetute/errate.
+        #domanda attuale dello stato. Questo impedisce che gli argomenti forniti dal planner contengano
+        #query precedenti o JSON incorporato che causano ricerche ripetute/errate.
         try:
             if isinstance(name, str) and "neo4j_vector_search" in name.lower():
                 current_question = state.get("question", "")
@@ -1101,7 +1079,7 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, checkp
                     args["query"] = current_question
                     logger.debug(f"node_call_tool: enforcing current question for {name}: '{current_question[:100]}'")
                 elif not args.get("query", "").strip():
-                    # fallback if no current question and no valid query in args
+                    #fallback if no current question and no valid query in args
                     args["query"] = "dispositivo funzionalità"  
                     logger.warning(f"node_call_tool: no valid query for {name}, using generic fallback")
         except Exception:
@@ -1154,7 +1132,6 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, checkp
                 except Exception:
                     pass
             out = result
-            #debug: log tool execution result type and repr
             try:
                 logger.info(f"node_call_tool: tool {name} returned type={type(out)} repr={repr(out)[:400]}")
             except Exception:
@@ -1184,7 +1161,7 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, checkp
             "intermediate_steps": new_steps
         }
 
-    # node: sintetizzatore - produce la risposta finale
+    #node: agente "sintetizzatore" - produce la risposta finale
     async def node_synth(state: Dict[str, Any]) -> Dict[str, Any]:
         # raccogli gli output recenti degli strumenti e la cronologia della chat, quindi chiama synth una volta
         chat = state.get("chat_history", [])
@@ -1254,9 +1231,7 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, checkp
 
         logger.debug("node_synth: invoking synth llm for final answer")
         try:
-            # synth can be synchronous; safe to call inside async node
             resp = synth.invoke(msgs)
-            # debug: log raw synth resp
             logger.info(f"node_synth: raw synth resp type={type(resp)} repr={repr(resp)[:400]}")
             final = getattr(resp, "content", None) or str(resp)
         except Exception:
@@ -1264,14 +1239,12 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, checkp
             final = "error generating final answer"
 
         am = AIMessage(content=final)
-        # checkpoint: save summary of this interaction
         try:
             ck = {"question": state.get("question"), "answer": final, "ts": int(time.time())}
             _save_checkpoint(ck)
         except Exception:
             logger.exception("checkpoint save failed")
 
-        # Automatic answer logging to Neo4j after synthesis
         try:
             global _global_last_search_metadata
             current_question = state.get("question", "")
@@ -1279,7 +1252,6 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, checkp
             current_user_id = _global_user_id or "default_user"
             
             if current_question and current_question.strip() and current_filename and final:
-                # Get chunk metadata from global variable (populated by tools)
                 external_chunks = _global_last_search_metadata.get("external_chunks", [])
                 primary_chunks = _global_last_search_metadata.get("primary_chunks", [])
                 
@@ -1293,15 +1265,13 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, checkp
                     primary_chunks=primary_chunks if primary_chunks else None
                 )
                 
-                # Clear metadata for next question
                 _global_last_search_metadata = {}
             else:
                 logger.warning(f"node_synth: skipping answer logging - missing data (question={bool(current_question)}, filename={bool(current_filename)}, answer={bool(final)})")
         except Exception:
             logger.exception("node_synth: automatic answer logging failed (non-critical)")
 
-        # go to end by returning chat_history with final ai message
-        # include a final_content marker to ensure callers can detect final answer regardless of stream shape
+
         return {"chat_history": state.get("chat_history", []) + [am], "final_content": final, "final_ai": True}
 
     #costruzione workflow langraph
@@ -1314,7 +1284,7 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, checkp
 
     wf.set_entry_point("firewall")
 
-    # transizioni (edges): firewall -> presearch -> planner -> scelta se call_tool oppure sintetizzatore
+    #transizioni (edges): firewall -> presearch -> planner -> scelta se call_tool oppure sintetizzatore
     wf.add_conditional_edges(
         "firewall",
         lambda s: "presearch" if s.get("approved") else END,
@@ -1329,7 +1299,7 @@ def _build_agent_workflow(planner_llm: Any = None, synth_llm: Any = None, checkp
     wf.add_edge("call_tool", "planner")
     wf.add_edge("synth", END)
 
-    # compila il workflow    
+    #compila il workflow    
     if checkpointer is not None:
         app = wf.compile(checkpointer=checkpointer)
     else:
@@ -1343,7 +1313,7 @@ async def invoke_agent(agent_app, user_message: str, chat_history: List[BaseMess
     final_response = ""
     agen = None
     
-    # Debug
+    #Debug
     logger.info(f"invoke_agent: processing question='{user_message}' with {len(chat_history or [])} messages in chat_history")
     if chat_history:
         last_msg = chat_history[-1] if chat_history else None
@@ -1422,23 +1392,22 @@ async def invoke_agent(agent_app, user_message: str, chat_history: List[BaseMess
                     extracted = {'chat_history': [chunk]}
 
                 if extracted:
-                    # question
+                    #question
                     q_new = extracted.get('question')
                     if isinstance(q_new, str) and q_new.strip():
                         merged_state['question'] = q_new
                     elif 'question' not in merged_state:
                         merged_state['question'] = initial_state.get('question','')
-                    # chat history
+                    #chat history
                     if 'chat_history' in extracted and isinstance(extracted['chat_history'], list):
                         existing = merged_state.get('chat_history', [])
                         for m in extracted['chat_history']:
                             if not any((getattr(m,'content',None)==getattr(o,'content',None) and type(m)==type(o)) for o in existing):
                                 existing.append(m)
                         merged_state['chat_history'] = existing
-                    # intermediate steps
+                    
                     if 'intermediate_steps' in extracted:
                         merged_state['intermediate_steps'] = extracted.get('intermediate_steps') or []
-                    # finals
                     if 'final_content' in extracted:
                         merged_state['final_content'] = extracted['final_content']
                     if extracted.get('final_ai'):
@@ -1448,7 +1417,6 @@ async def invoke_agent(agent_app, user_message: str, chat_history: List[BaseMess
                 logger.info(f"invoke_agent: merged_state keys={list(merged_state.keys())}")
                 logger.info(f"invoke_agent: merged_state.question='{merged_state.get('question','')}' chat_len={len(merged_state.get('chat_history',[]))}")
 
-                # accumulate messages for fallback detection
                 try:
                     if extracted:
                         msgs = _extract_messages_from(extracted)
@@ -1472,7 +1440,6 @@ async def invoke_agent(agent_app, user_message: str, chat_history: List[BaseMess
         if final_response:
             return final_response
 
-        #no final response found: log helpful summary and optionally try checkpoint recovery
         try:
             if accumulated:
                 summary = []

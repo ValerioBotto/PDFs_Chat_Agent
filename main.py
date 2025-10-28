@@ -3,6 +3,7 @@ import os
 import logging
 import asyncio
 import uuid
+import time
 from typing import List, Any
 
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
@@ -110,7 +111,7 @@ Otherwise, output a normal textual answer without that JSON line.''',
             #parse oggetti JSON con tool_calls
             tool_calls = None
             try:
-                # Search for JSON content first
+                #search for JSON content first
                 json_markers = [
                     (r"```(?:json)?\s*(\{[\s\S]*?\"tool_calls\"[\s\S]*?\})\s*```", re.IGNORECASE),  
                     (r"(\{[\s\S]*?\"tool_calls\"[\s\S]*?\})", 0),  
@@ -132,7 +133,7 @@ Otherwise, output a normal textual answer without that JSON line.''',
             except Exception:
                 tool_calls = None
 
-            # euristica: se il modello menziona neo4j_vector_search nel testo normale, converti in un tool_call
+            #euristica: se il modello menziona neo4j_vector_search nel testo normale, converti in un tool_call
             if not tool_calls:
                 try:
                     lower = text.lower()
@@ -217,6 +218,22 @@ def get_or_create_event_loop():
         raise
 
 
+#yield chunks to Streamlit write_stream for progressive display
+def stream_response_chunks(text: str, chunk_size: int = 25, delay: float = 0.0):
+    if not text:
+        yield ""
+        return
+    words = text.split()
+    if not words:
+        yield text
+        return
+    for idx in range(0, len(words), chunk_size):
+        chunk = " ".join(words[idx:idx + chunk_size]) + " "
+        yield chunk
+        if delay > 0:
+            time.sleep(delay)
+
+
 #funzione per inizializzare l'agente in un contesto asincrono
 async def setup_agent_and_mcp(uploaded_file_data, llm_agent, indexer_instance, extractor_instance):
     if not TOGETHER_API_KEY:
@@ -239,7 +256,7 @@ async def setup_agent_and_mcp(uploaded_file_data, llm_agent, indexer_instance, e
 
     graph_db = None
     try:
-        #1) processing del pdf
+        #1)processing del pdf
         doc = st.session_state.layout_extractor(file_bytes)
         if doc is None:
             raise ValueError("errore nell'estrazione del documento dal pdf.")
@@ -251,7 +268,7 @@ async def setup_agent_and_mcp(uploaded_file_data, llm_agent, indexer_instance, e
         st.session_state.processed_chunks = chunks
         logger.info(f"total of {len(chunks)} chunks generated from all sections.")
 
-        #2) interazione con neo4j e indicizzazione
+        #2)interazione con neo4j e indicizzazione
         graph_db = GraphDB()
         user_id = "default_user"
         graph_db.create_user(user_id)
@@ -479,7 +496,7 @@ if st.session_state.pdf_uploaded and st.session_state.agent_app:
                     elif response_content.startswith("Errore") or "rate-limiting" in response_content.lower():
                         st.error(response_content)
 
-                    st.markdown(response_content)
+                    st.write_stream(stream_response_chunks(response_content))
                     st.session_state.chat_history.append(AIMessage(content=response_content))
                 except Exception as e:
                     st.error(f"errore durante l'interazione con l'agente: {e}")

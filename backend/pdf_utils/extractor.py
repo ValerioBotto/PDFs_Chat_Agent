@@ -98,13 +98,6 @@ class Extractor:
         self.active_filename = None
 
     def attach_graph(self, graph_db, active_filename: str | None = None):
-        """Collega Neo4j e carica la mappa sinonimi iniziale.
-
-        Strategia di preload:
-        - Carica prima i sinonimi globali (tutti i documenti)
-        - Se viene passato un filename attivo, carica anche i sinonimi specifici del documento
-          sovrascrivendo eventuali collisioni (priorità al documento corrente).
-        """
         self.graph_db = graph_db
         self.active_filename = active_filename
         try:
@@ -143,7 +136,6 @@ class Extractor:
         return None
 
     def _call_llm(self, prompt_template: PromptTemplate, **kwargs) -> str:
-        """helper function to call LLM with a given prompt and parse response."""
         chain = prompt_template | self.llm
         response = chain.invoke(kwargs)
         # estraiamo il contenuto dal wrapper di langchain
@@ -154,7 +146,6 @@ class Extractor:
         return str(response)
 
     def extract_topics(self, text: str, max_topics: int = 5) -> List[str]:
-        """estrae topic da un testo usando l'LLM e li normalizza (dinamicamente via Neo4j quando disponibile)."""
         raw_topics_str = self._call_llm(self.topic_extraction_prompt, text=text, max_topics=max_topics)
 
         # pulisce e spacchetta i topic
@@ -183,7 +174,6 @@ class Extractor:
         return unique_norm[:max_topics]
 
     def extract_entities(self, text: str) -> Dict[str, List[str]]:
-        """Estrae entità da un testo usando l'LLM."""
         raw_entities_str = self._call_llm(self.entity_extraction_prompt, text=text)
         
         #Inizializza il dizionario delle entità con le chiavi dei tipi selezionati
@@ -210,9 +200,6 @@ class Extractor:
         return {k: list(set(v)) for k, v in entities.items() if v}
 
     def _dynamic_synonym_update(self, new_topic: str, context_text: str = None):
-        """
-         aggiorna la mappa locale.
-        """
         try:
             context = (context_text or "")[:2000]
             resp = self._call_llm(self.synonym_induction_prompt, term=new_topic, context=context)
@@ -240,7 +227,6 @@ class Extractor:
             if not canonical:
                 return None
 
-            # dedup, rimuovi canonical e limita a massimo 4
             seen = set()
             filtered = []
             for s in syns:

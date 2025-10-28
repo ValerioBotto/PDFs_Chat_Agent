@@ -13,19 +13,6 @@ def split_sections_into_chunks(
     chunk_size: int = 500,
     chunk_overlap: int = 50
 ) -> List[Document]:
-    """
-    divide le sezioni di testo in chunk più piccoli utilizzando RecursiveCharacterTextSplitter.
-
-    args:
-        sections (dict): un dizionario dove le chiavi sono i titoli delle sezioni
-                         e i valori sono i testi delle sezioni.
-        chunk_size (int): la dimensione massima desiderata per ogni chunk.
-        chunk_overlap (int): la dimensione della sovrapposizione tra chunk consecutivi.
-
-    returns:
-        list[Document]: una lista di oggetti Document, dove ogni Document
-                        rappresenta un chunk con i suoi metadati.
-    """
     
     #gestione delle sezioni vuote
     if not sections:
