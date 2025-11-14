@@ -140,7 +140,7 @@ def _get_firewall_llm() -> Optional[ChatTogether]:
     if not api_key:
         logger.error("firewall LLM non configurato: MANCA LA TOGETHER_API_KEY")
         return None
-    model = os.getenv("FIREWALL_MODEL", "meta-llama/Llama-3.3-70B-Instruct-Turbo-Free")
+    model = os.getenv("FIREWALL_MODEL", "ServiceNow-AI/Apriel-1.5-15b-Thinker")
     try:
         temperature = float(os.getenv("FIREWALL_TEMPERATURE", "0"))
     except Exception:

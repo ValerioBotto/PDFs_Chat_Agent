@@ -14,7 +14,7 @@ load_dotenv()
 TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY")
 
 class Extractor:
-    def __init__(self, llm_model_name: str = "meta-llama/Llama-3.3-70B-Instruct-Turbo-Free"):
+    def __init__(self, llm_model_name: str = "ServiceNow-AI/Apriel-1.5-15b-Thinker"):
         if not TOGETHER_API_KEY:
             raise ValueError("TOGETHER_API_KEY non è impostata nell'ambiente.")
         

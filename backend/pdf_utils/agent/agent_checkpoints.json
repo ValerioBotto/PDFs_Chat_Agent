@@ -1,10 +1,5 @@
 [
   {
-    "question": "Di cosa parla il documento?",
-    "answer": "Non posso fornire informazioni sul documento in questione, poiché non sono state fornite informazioni specifiche sul documento stesso (chunk:nessuno). Se puoi fornire maggiori dettagli o chiarire a quale documento ti riferisci, sarò felice di aiutarti con le informazioni in mio possesso.",
-    "ts": 1759997103
-  },
-  {
     "question": "il topic principale qual è?",
     "answer": "Non sono in grado di determinare il topic principale del documento, poiché non ho ricevuto informazioni sufficienti sul suo contenuto (chunk:nessuno). Se puoi fornire maggiori dettagli o chiarire a quale documento ti riferisci, sarò felice di aiutarti con le informazioni in mio possesso.",
     "ts": 1759997169
@@ -248,5 +243,10 @@
     "question": "Di cosa parla il pdf?",
     "answer": "Il PDF parla dello sviluppo di un agente conversazionale per documenti PDF, progettato per supportare l'estrazione e la sintesi di informazioni in domini caratterizzati da un'elevata densità informativa, utilizzando paradigmi dell'Agentic AI e Retrieval-Augmented Generation (chunk:università degli studi di catania_2, chunk:università degli studi di catania_5).",
     "ts": 1761659102
+  },
+  {
+    "question": "di cosa parla il pdf?",
+    "answer": "Il PDF è l’abstract della tesi di laurea magistrale in Scienze del Testo per le professioni digitali (LM‑43) dell’Università degli Studi di Catania, intitolata “Agentic AI e Retrieval Augmented Generation: Sviluppo di un Agente Conversazionale su Documenti PDF” (chunk:0).  \n\nIl lavoro parte dal problema della consultazione di documenti tecnici, manuali o referti medici,",
+    "ts": 1763125695
   }
 ]

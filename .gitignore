@@ -1,15 +1,47 @@
-.venv/
-venv/
-
-
-.env/
+# Environment variables (CRITICAL - contains API keys!)
+.env
 *.env
+.env.local
+.env.*.local
 
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv
 
+# Neo4j
+neo4j_data/
+*.db
+
+# IDE
 .vscode/
+.idea/
+*.swp
+*.swo
+*~
 
-.cache/
+# OS
+.DS_Store
+Thumbs.db
 
-models/
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.bak
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Agent checkpoints 
+backend/pdf_utils/agent/agent_checkpoints.json
+
+# PDF files 
+*.pdf

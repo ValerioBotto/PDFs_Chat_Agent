@@ -52,7 +52,7 @@ if "extractor" not in st.session_state:
     st.session_state.extractor = Extractor()
 if "llm_agent" not in st.session_state:
     st.session_state.llm_agent = ChatTogether(
-        model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
+        model="ServiceNow-AI/Apriel-1.5-15b-Thinker",
         temperature=1.0,
         together_api_key=TOGETHER_API_KEY,
         max_tokens=1024,
