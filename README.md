@@ -105,6 +105,15 @@ To get the PDFs_Chat_Agent running locally, follow these steps:
     ```
     This will open the application in your web browser. You can then upload PDFs and start interacting with the AI agent.
 
+## Pictures
+
+
+<img width="1429" height="1379" alt="Screenshot 2025-10-29 125934" src="https://github.com/user-attachments/assets/7921adea-f63e-4b5b-aaba-7f96d9aa4e7a" />
+
+<img width="1426" height="1705" alt="Screenshot 2025-10-20 162014" src="https://github.com/user-attachments/assets/0d72c2cd-173a-4cb1-a4f2-c76f17bd1b3c" />
+
+
+
 ## Credits
 
 Developed by Valerio Botto as part of a master's degree internship at Logogramma s.r.l.
