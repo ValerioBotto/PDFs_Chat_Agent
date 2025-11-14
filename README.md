@@ -1,5 +1,4 @@
 # PDFs_Chat_Agent
-<<<<<<< HEAD
 
 ## Project Overview
 
@@ -121,4 +120,4 @@ Developed by Valerio Botto as part of a master's degree internship at Logogramma
 Connect with me on LinkedIn: [https://www.linkedin.com/in/valerio-botto-4844b2190/](https://www.linkedin.com/in/valerio-botto-4844b2190/)
 =======
 Interactive AI agent for Technical/medical/legislative PDF(s) analysis. Upload documents, extract key topics, and get contextual answers via an AI conversational agent. Leverages LangChain/LangGraph, Neo4j knowledge graph, and vector DB for semantic retrieval, offering dynamic, personalized document consultation.
->>>>>>> 856c2434f8d3c8416ebbe1b7a75037367eec1c68
+
