@@ -1,4 +1,6 @@
 # PDFs_Chat_Agent
+=======
+Interactive AI agent for Technical/medical/legislative PDF(s) analysis. Upload documents, extract key topics, and get contextual answers via an AI conversational agent. Leverages LangChain/LangGraph, Neo4j knowledge graph, and vector DB for semantic retrieval, offering dynamic, personalized document consultation.
 
 ## Project Overview
 
@@ -118,6 +120,4 @@ To get the PDFs_Chat_Agent running locally, follow these steps:
 Developed by Valerio Botto as part of a master's degree internship at Logogramma s.r.l.
 
 Connect with me on LinkedIn: [https://www.linkedin.com/in/valerio-botto-4844b2190/](https://www.linkedin.com/in/valerio-botto-4844b2190/)
-=======
-Interactive AI agent for Technical/medical/legislative PDF(s) analysis. Upload documents, extract key topics, and get contextual answers via an AI conversational agent. Leverages LangChain/LangGraph, Neo4j knowledge graph, and vector DB for semantic retrieval, offering dynamic, personalized document consultation.
 
